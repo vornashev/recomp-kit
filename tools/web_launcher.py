@@ -52,6 +52,8 @@ def game_entry(cfg):
         "store": launcher["store"],
         "installNames": launcher["install_names"],
         "minFreeMb": launcher["min_free_mb"],
+        "savesDir": launcher["saves_dir"],
+        "saveExt": launcher["save_ext"],
     }
 
 
@@ -137,6 +139,9 @@ def excluded(relative, patterns):
                for p in patterns)
 
 
+SMALL_FILE = 1 << 20
+
+
 def publish_game_files(game_id, install, out, patterns):
     """<out>/<id>/game/: the installation as links, and manifest.txt, one
     "<size>\t<mtime>\t<path>" line per file, for the player's stream."""
@@ -150,7 +155,7 @@ def publish_game_files(game_id, install, out, patterns):
         for name in sorted(files):
             src = Path(root) / name
             rel = src.relative_to(install).as_posix()
-            if excluded(rel, patterns) or rel == "manifest.txt":
+            if excluded(rel, patterns) or rel in ("manifest.txt", "small.pack", "hot.txt"):
                 continue
             st = src.stat()
             link = dest / rel
@@ -158,8 +163,25 @@ def publish_game_files(game_id, install, out, patterns):
             link.symlink_to(src)
             lines.append("%d\t%d\t%s" % (st.st_size, int(st.st_mtime), rel))
             total += st.st_size
-    (dest / "manifest.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("published %d files (%.0f MB) of %s at %s" % (len(lines), total / 1e6, install, dest))
+    # The small files (maps, campaigns, the odd table) in one pack: the
+    # scenario list reads every map's header, and fetching ninety files one
+    # request at a time is seconds of round trips. The player fetches the pack
+    # once, in the background, and files its parts into its cache.
+    small = [line for line in lines if int(line.split("\t")[0]) <= SMALL_FILE]
+    with open(dest / "small.pack", "wb") as pack:
+        for i, line in enumerate(lines):
+            size, stamp, rel = line.split("\t", 2)
+            if int(size) > SMALL_FILE:
+                continue
+            offset = pack.tell()
+            with open(install / rel, "rb") as f:
+                shutil.copyfileobj(f, pack)
+            lines[i] = "%s\t%s\t%s\t%d" % (size, stamp, rel, offset)
+        pack_size = pack.tell()
+    header = "#pack\tsmall.pack\t%d" % pack_size
+    (dest / "manifest.txt").write_text(header + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+    print("published %d files (%.0f MB) of %s at %s; %d small ones packed (%.1f MB)"
+          % (len(lines), total / 1e6, install, dest, len(small), pack_size / 1e6))
 
 
 class IsolatedHandler(http.server.SimpleHTTPRequestHandler):

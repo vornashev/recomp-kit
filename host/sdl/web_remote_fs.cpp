@@ -120,6 +120,12 @@ uint64_t g_fetched_bytes = 0, g_fetches = 0;
 // Reads waiting on the network. The prefetcher starts nothing while one is:
 // the game's own request comes first.
 std::atomic<int> g_readers_waiting{0};
+// When the game last fetched something itself (emscripten_get_now ms). Its
+// reads come in bursts - a dialog, a map - and a background request started
+// inside a burst sits in front of the next read, so the prefetcher waits for
+// a quiet moment.
+std::atomic<double> g_last_read_fetch{0};
+constexpr double QUIET_MS = 400;
 
 const std::vector<uint8_t> *ram_find(RemoteFile *file, uint64_t index) {
     for (size_t i = g_ram.size(); i-- > 0;)
@@ -255,6 +261,7 @@ class RemoteFile : public DataFile {
             return hit;
         ++g_readers_waiting;
         const bool fetched = fetch_run(index, until);
+        g_last_read_fetch = emscripten_get_now();
         --g_readers_waiting;
         if (!fetched)
             return nullptr;
@@ -291,9 +298,18 @@ class RemoteFile : public DataFile {
     const std::string &rel() const {
         return rel_;
     }
+    // Under g_lock: every chunk already stored.
+    bool complete() {
+        load_cache();
+        for (uint8_t b : have_)
+            if (!b)
+                return false;
+        return cache_ok_;
+    }
     // Keeps a run fetched outside the lock; chunks a reader stored meanwhile
     // are left as they are.
     void store(uint64_t index, const std::vector<uint8_t> &run) {
+        load_cache();
         bool changed = false;
         for (uint64_t k = index, at = 0; at < run.size() && k < have_.size(); ++k, at += CHUNK) {
             if (have_[k] || !cache_ok_)
@@ -379,6 +395,59 @@ std::atomic<size_t> g_hot_next{0};
 std::atomic<uint64_t> g_prefetched{0};
 std::atomic<int> g_prefetchers{0};
 
+// The pack (manifest "#pack" line): the small files back to back, fetched in
+// one request and filed into the cache, ahead of the hot list.
+struct PackItem {
+    RemoteFile *file;
+    uint64_t offset, size;
+};
+std::string g_pack_name;
+uint64_t g_pack_size = 0;
+std::vector<PackItem> g_pack;
+
+void prefetch_worker();
+
+void fetch_pack() {
+    bool needed = false;
+    {
+        std::lock_guard<std::mutex> hold(g_lock);
+        for (const PackItem &p : g_pack)
+            if (!p.file->complete()) {
+                needed = true;
+                break;
+            }
+    }
+    if (!needed || !g_pack_size)
+        return;
+    const double started = emscripten_get_now();
+    std::vector<uint8_t> pack(g_pack_size);
+    const std::string url = g_base_url + "/" + g_pack_name;
+    if (remote_fetch_range(url.c_str(), 0, (double)g_pack_size - 1, pack.data()) != (double)g_pack_size) {
+        fprintf(stderr, "[remote] %s could not be fetched\n", g_pack_name.c_str());
+        return;
+    }
+    std::vector<uint8_t> part;
+    for (const PackItem &p : g_pack) {
+        if (p.offset + p.size > pack.size())
+            continue;
+        part.assign(pack.begin() + p.offset, pack.begin() + p.offset + p.size);
+        std::lock_guard<std::mutex> hold(g_lock);
+        p.file->store(0, part);
+    }
+    fprintf(stderr, "[remote] %zu small files (%.1f MB) fetched in one request in %.1f s\n", g_pack.size(),
+            g_pack_size / 1e6, (emscripten_get_now() - started) / 1000.0);
+}
+
+// Background fetching: the pack first, then the hot list on two threads.
+void prefetch_main() {
+    fetch_pack();
+    if (g_hot.empty())
+        return;
+    g_prefetchers = 2;
+    std::thread(prefetch_worker).detach();
+    prefetch_worker();
+}
+
 void prefetch_worker() {
     std::vector<uint8_t> run;
     const double started = emscripten_get_now();
@@ -386,8 +455,9 @@ void prefetch_worker() {
         const HotItem &h = g_hot[i];
         for (uint64_t at = h.first;;) {
             uint64_t end = 0, bytes = 0;
-            while (g_readers_waiting.load() > 0)
-                emscripten_thread_sleep(10);
+            while (g_readers_waiting.load() > 0 ||
+                   emscripten_get_now() - g_last_read_fetch.load() < QUIET_MS)
+                emscripten_thread_sleep(20);
             {
                 std::lock_guard<std::mutex> hold(g_lock);
                 if (!h.file->next_missing(&at, h.last, &end))
@@ -483,6 +553,16 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
     size_t files = 0;
     unsigned long long bytes = 0;
     for (char *line = strtok(manifest, "\n"); line; line = strtok(nullptr, "\n")) {
+        if (line[0] == '#') {
+            // "#pack\t<name>\t<size>"
+            char *name = strchr(line, '\t');
+            char *size = name ? strchr(name + 1, '\t') : nullptr;
+            if (!strncmp(line, "#pack\t", 6) && size) {
+                g_pack_name.assign(name + 1, size - name - 1);
+                g_pack_size = strtoull(size + 1, nullptr, 10);
+            }
+            continue;
+        }
         char *tab1 = strchr(line, '\t');
         char *tab2 = tab1 ? strchr(tab1 + 1, '\t') : nullptr;
         if (!tab2)
@@ -491,12 +571,21 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
         std::string path = tab2 + 1;
         if (!path.empty() && path.back() == '\r')
             path.pop_back();
+        // A fourth column: where the file sits in the pack.
+        int64_t pack_offset = -1;
+        const size_t tab3 = path.find('\t');
+        if (tab3 != std::string::npos) {
+            pack_offset = strtoll(path.c_str() + tab3 + 1, nullptr, 10);
+            path.resize(tab3);
+        }
         auto dir = backend->root;
         size_t at = 0;
         for (size_t slash; (slash = path.find('/', at)) != std::string::npos; at = slash + 1)
             dir = dir->subdir(path.substr(at, slash - at));
         auto file = std::make_shared<RemoteFile>(path, size, stamp, id);
         by_path[path] = file.get();
+        if (pack_offset >= 0 && size)
+            g_pack.push_back({file.get(), (uint64_t)pack_offset, size});
         dir->add(path.substr(at), file);
         ++files;
         bytes += size;
@@ -504,7 +593,8 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
     free(manifest);
     fprintf(stderr, "[remote] %s: %zu files, %.0f MB, streamed from %s\n", mount, files, bytes / 1e6,
             g_base_url.c_str());
-    if (char *hot = remote_fetch_text((g_base_url + "/hot.txt").c_str())) {
+    char *hot = remote_fetch_text((g_base_url + "/hot.txt").c_str());
+    if (hot) {
         for (char *line = strtok(hot, "\n"); line; line = strtok(nullptr, "\n")) {
             char *tab1 = strchr(line, '\t');
             char *tab2 = tab1 ? strchr(tab1 + 1, '\t') : nullptr;
@@ -516,13 +606,10 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
                 g_hot.push_back({it->second, strtoull(tab1 + 1, nullptr, 10), strtoull(tab2 + 1, nullptr, 10)});
         }
         free(hot);
-        // Two requests in flight beside the game's own.
-        constexpr int THREADS = 2;
-        g_prefetchers = THREADS;
-        for (int i = 0; i < THREADS; ++i)
-            std::thread(prefetch_worker).detach();
         fprintf(stderr, "[remote] fetching %zu hot ranges ahead\n", g_hot.size());
     }
+    if (!g_pack.empty() || !g_hot.empty())
+        std::thread(prefetch_main).detach();
     return files > 0;
 }
 #endif

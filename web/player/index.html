@@ -19,12 +19,31 @@
           border: 1px solid #3a4a5a; border-radius: 6px; background: rgba(10, 16, 24, .82);
           color: #7fe0c0; font: 600 13px ui-monospace, monospace; cursor: pointer; opacity: .75; }
   #perf:hover { opacity: 1; }
+  #saves-button { position: fixed; left: 92px; top: 8px; height: 28px; padding: 0 10px; z-index: 10;
+                  border: 1px solid #5a4a2a; border-radius: 6px; background: rgba(24, 18, 8, .82);
+                  color: #f0d890; font: 600 13px system-ui, sans-serif; cursor: pointer; opacity: .75; }
+  #saves-button:hover { opacity: 1; }
+  #saves { position: fixed; left: 8px; top: 44px; z-index: 11; width: min(420px, calc(100vw - 16px));
+           max-height: calc(100vh - 60px); overflow: auto; box-sizing: border-box; padding: 12px;
+           border: 1px solid #5a4a2a; border-radius: 8px; background: rgba(24, 18, 8, .95);
+           color: #f0e6cf; font: 14px system-ui, sans-serif; }
+  #saves h2 { margin: 0 0 8px; font-size: 15px; color: #f0d890; }
+  #saves p { margin: 6px 0; color: #b9a888; font-size: 12px; }
+  #saves ul { list-style: none; margin: 8px 0; padding: 0; }
+  #saves li { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-top: 1px solid #3a3020; }
+  #saves li span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #saves small { color: #b9a888; }
+  #saves button, #saves label { background: #3a2e18; color: #f0e6cf; border: 1px solid #6a5a3a;
+           border-radius: 5px; padding: 3px 8px; font: inherit; font-size: 12px; cursor: pointer; }
+  #saves label input { display: none; }
 </style>
 </head>
 <body>
 <canvas id="canvas" tabindex="-1"></canvas>
 <div id="status">Loading…</div>
 <button id="perf" type="button" hidden title="Show or hide the frame statistics"></button>
+<button id="saves-button" type="button" hidden></button>
+<div id="saves" hidden></div>
 <script>
 "use strict";
 const statusEl = document.getElementById("status");
@@ -114,6 +133,7 @@ async function start() {
     onRuntimeInitialized() {
       status("");
       setupPerfButton(Module);
+      setupSaves(id, game);
       canvas.focus();
       Module.callMain([`--exe=${exe}`]);
     },
@@ -148,6 +168,114 @@ function setupPerfButton(m) {
   const sync = () => { button.hidden = !m._recomp_web_overlay_mode(); };
   sync();
   setInterval(sync, 1000);
+}
+
+// Saves live in the browser's private storage, in the profile the game writes
+// through (<id>/profile/<saves dir>). This panel lists them, imports a save
+// file from disk (to continue a game from elsewhere) and exports one back.
+const ru = (navigator.language || "").toLowerCase().startsWith("ru");
+const T = ru ? {
+  button: "Сохранения", title: "Сохранения в этом браузере", none: "Сохранений пока нет.",
+  upload: "Загрузить файл…", download: "Скачать", remove: "Удалить",
+  confirm: (n) => `Удалить сохранение «${n}»?`,
+  note: "Хранятся в памяти этого браузера. Загруженный файл появится в окне «Загрузить игру».",
+  persisted: "Хранилище помечено как постоянное.",
+  notPersisted: "Браузер может очистить хранилище при нехватке места: скачивайте важные сохранения.",
+} : {
+  button: "Saves", title: "Saves in this browser", none: "No saves yet.",
+  upload: "Import file…", download: "Download", remove: "Delete",
+  confirm: (n) => `Delete the save "${n}"?`,
+  note: "Kept in this browser's storage. An imported file shows up in the game's load dialog.",
+  persisted: "Storage is marked persistent.",
+  notPersisted: "The browser may clear its storage when space runs low: download saves you care about.",
+};
+async function savesDir(id, dir, create) {
+  let h = await navigator.storage.getDirectory();
+  for (const p of [id, "profile", ...dir.split("/").filter(Boolean)])
+    h = await h.getDirectoryHandle(p, { create });
+  return h;
+}
+function setupSaves(id, game) {
+  if (!game.savesDir) return;
+  const button = document.getElementById("saves-button");
+  const panel = document.getElementById("saves");
+  button.textContent = T.button;
+  button.hidden = false;
+  const ext = (game.saveExt || "").toLowerCase();
+  const render = async () => {
+    panel.replaceChildren();
+    const h2 = document.createElement("h2");
+    h2.textContent = T.title;
+    const list = document.createElement("ul");
+    let dir = null;
+    try { dir = await savesDir(id, game.savesDir, false); } catch {}
+    const files = [];
+    if (dir)
+      for await (const [name, h] of dir.entries())
+        if (h.kind === "file" && (!ext || name.toLowerCase().endsWith(ext)))
+          files.push({ name, file: await h.getFile() });
+    files.sort((a, b) => b.file.lastModified - a.file.lastModified);
+    for (const { name, file } of files) {
+      const li = document.createElement("li");
+      const label = document.createElement("span");
+      label.textContent = name;
+      label.title = name;
+      const when = document.createElement("small");
+      when.textContent = new Date(file.lastModified).toLocaleString();
+      const down = document.createElement("button");
+      down.textContent = T.download;
+      down.onclick = () => {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(file);
+        a.download = name;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      };
+      const del = document.createElement("button");
+      del.textContent = T.remove;
+      del.onclick = async () => {
+        if (!confirm(T.confirm(name))) return;
+        await dir.removeEntry(name).catch(() => {});
+        render();
+      };
+      li.append(label, when, down, del);
+      list.append(li);
+    }
+    if (!files.length) {
+      const li = document.createElement("li");
+      li.textContent = T.none;
+      list.append(li);
+    }
+    const upload = document.createElement("label");
+    upload.textContent = T.upload;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    if (ext) input.accept = ext;
+    input.onchange = async () => {
+      const target = await savesDir(id, game.savesDir, true);
+      for (const f of input.files) {
+        const w = await (await target.getFileHandle(f.name, { create: true })).createWritable();
+        await w.write(f);
+        await w.close();
+      }
+      render();
+    };
+    upload.append(input);
+    const note = document.createElement("p");
+    note.textContent = T.note;
+    const persist = document.createElement("p");
+    persist.textContent = (await navigator.storage.persisted?.()) ? T.persisted : T.notPersisted;
+    panel.append(h2, list, upload, note, persist);
+  };
+  button.addEventListener("click", async () => {
+    if (panel.hidden) {
+      await navigator.storage.persist?.().catch(() => {});
+      await render();
+    }
+    panel.hidden = !panel.hidden;
+    if (panel.hidden) canvas.focus();
+  });
 }
 
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());

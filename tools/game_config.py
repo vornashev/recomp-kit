@@ -207,6 +207,12 @@ def load(game_dir):
     for key in ("title", "store"):
         if not isinstance(launcher[key], str):
             raise ValueError("%s: [launcher] %s must be a string" % (source, key))
+    # Where the game keeps its saves, relative to its folder, and their
+    # extension: the web player's saves panel imports and exports these.
+    for key in ("saves_dir", "save_ext"):
+        launcher.setdefault(key, "")
+        if not isinstance(launcher[key], str):
+            raise ValueError("%s: [launcher] %s must be a string" % (source, key))
     min_free = launcher.setdefault("min_free_mb", 0)
     if not isinstance(min_free, int) or min_free < 0:
         raise ValueError("%s: [launcher] min_free_mb must be a non-negative integer" % source)
