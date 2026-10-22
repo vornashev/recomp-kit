@@ -54,6 +54,7 @@
 #include "../gpu/d3d9_backend.h"
 #include <emscripten/emscripten.h>
 #include <emscripten/wasmfs.h>
+#include "web_remote_fs.h"
 #include <thread>
 #endif
 #include <SDL3/SDL_vulkan.h>
@@ -1636,6 +1637,12 @@ void web_guest() {
     backend_t opfs = wasmfs_create_opfs_backend();
     if (!opfs || wasmfs_create_directory("/opfs", 0777, opfs) != 0)
         fprintf(stderr, RECOMP_APP_NAME ": the browser's private file system is unavailable\n");
+    // A game the page did not import is streamed from the server instead
+    // (RECOMP_REMOTE_GAME is the URL of its folder; see web_remote_fs.h).
+    if (const char *url = recomp_env("REMOTE_GAME"); url && *url) {
+        if (!web_remote_mount(url, "/remote", recomp_env("REMOTE_CACHE")))
+            fprintf(stderr, RECOMP_APP_NAME ": the game could not be reached at %s\n", url);
+    }
     std::string dir = g_web_exe.substr(0, g_web_exe.find_last_of('/'));
     if (!dir.empty() && os_chdir(dir.c_str()) != 0)
         fprintf(stderr, "[host] could not enter %s\n", dir.c_str());
@@ -1703,6 +1710,7 @@ int web_main(int argc, char **argv) {
         return 3;
     D3DRenderer::setShared(renderer);
     host_present_set_device(g_gpu.get());
+    host_present_set_fifo(RECOMP_PRESENT_FIFO != 0); // [present] fifo in game.toml
     mods_display_live_defaults();
     mods_display_default_overlay(platform_ui_default_overlay());
     mods_display_load_modes(classic_modes_path().c_str());
@@ -1902,6 +1910,7 @@ int main(int argc, char **argv) {
         return 3;
     D3DRenderer::setShared(renderer);
     host_present_set_device(g_gpu.get());
+    host_present_set_fifo(RECOMP_PRESENT_FIFO != 0); // [present] fifo in game.toml
 
     fprintf(stderr, "Mouse capture: click inside to capture; hold Escape to release; drag to "
                     "the window edge to resize.\n");

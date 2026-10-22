@@ -271,6 +271,9 @@ void host_present_stop(void); // only after the guest scheduler has stopped
 // no drawable and presents nothing: what an iOS app must do in the background.
 void host_present_suspend(bool suspended);
 bool host_present_suspended(void);
+// Every sealed frame is shown once, oldest first, rather than only the newest
+// at each refresh: no game frame is skipped, at up to two frames of latency.
+void host_present_set_fifo(bool fifo);
 void host_frame_seal(void);
 void host_present_first_write(void);
 void host_present_stage_rgba(const uint8_t *rgba, int w, int h);

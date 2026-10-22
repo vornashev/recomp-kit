@@ -277,6 +277,10 @@ if(TARGET recomp_gen)
     set(APP ${RECOMP_APP_NAME})
     set(TITLE ${RECOMP_GAME_NAME})
     configure_file(${POP_ROOT}/web/player/index.html ${POP_OUT}/index.html @ONLY)
+    # The streamed game folder: a WasmFS backend, so it needs WasmFS's own headers.
+    target_sources(recomp_app PRIVATE ${HOST}/sdl/web_remote_fs.cpp)
+    set_source_files_properties(${HOST}/sdl/web_remote_fs.cpp PROPERTIES
+      INCLUDE_DIRECTORIES ${EMSCRIPTEN_ROOT_PATH}/system/lib/wasmfs)
     target_link_options(recomp_app PRIVATE
       -pthread -sPTHREAD_POOL_SIZE=24 -sWASMFS
       -sINITIAL_MEMORY=1073741824 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296

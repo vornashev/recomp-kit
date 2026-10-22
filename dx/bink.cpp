@@ -613,7 +613,18 @@ void BinkClose(X86 *c) {
         heap_free(rec);
     set_eax(c, 0);
 }
+bool player_rate(uint32_t rec, uint32_t *num, uint32_t *den) {
+    auto it = g_players.find(rec);
+    if (it == g_players.end() || it->second->fps.num <= 0 || it->second->fps.den <= 0)
+        return false;
+    *num = (uint32_t)it->second->fps.num;
+    *den = (uint32_t)it->second->fps.den;
+    return true;
+}
 #else
+bool player_rate(uint32_t, uint32_t *, uint32_t *) {
+    return false;
+}
 // A finished record makes a guest continue past cinematics on builds without
 // FFmpeg. It is a successful skip, so GetError remains an empty string.
 void BinkOpen(X86 *c) {
@@ -693,15 +704,24 @@ void BinkGetError(X86 *c) {
 
 // BinkGetSummary(bink, summary): the playback statistics record. Width,
 // height and the frame count come from the guest's own Bink record (+0, +4,
-// +8); the timing counters stay zero.
+// +8), the rates from the decoder. Heroes IV divides the frame count by
+// FrameRate (+0x14) to time a movie, so a rate is never left zero.
 void BinkGetSummary(X86 *c) {
     uint32_t rec = arg(c, 0), sum = arg(c, 1);
     if (sum && gm_valid(sum, 0x60)) {
         memset(g_mem + sum, 0, 0x60);
         if (rec && gm_valid(rec, 12)) {
+            uint32_t num = 15, den = 1;
+            player_rate(rec, &num, &den);
+            const uint32_t frames = rd32(rec + 0x08);
             wr32(sum + 0x00, rd32(rec + 0x00));
             wr32(sum + 0x04, rd32(rec + 0x04));
-            wr32(sum + 0x20, rd32(rec + 0x08)); // TotalFrames
+            wr32(sum + 0x08, (uint32_t)((uint64_t)frames * 1000u * den / num)); // TotalTime, ms
+            wr32(sum + 0x0c, num);                                             // FileFrameRate
+            wr32(sum + 0x10, den);                                             // FileFrameRateDiv
+            wr32(sum + 0x14, num);                                             // FrameRate
+            wr32(sum + 0x18, den);                                             // FrameRateDiv
+            wr32(sum + 0x20, frames);                                          // TotalFrames
         }
     }
     set_eax(c, 0);

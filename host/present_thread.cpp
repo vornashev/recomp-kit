@@ -58,6 +58,9 @@ extern "C" __attribute__((weak)) void host_present_mode(int *w, int *h, int *bpp
 }
 
 static std::atomic<bool> g_present_suspended{false};
+// Show every sealed frame once, oldest first, instead of only the newest
+// (host_present_set_fifo). Costs up to two frames of latency.
+std::atomic<bool> g_present_fifo{false};
 static std::mutex g_present_controls_mutex;
 static controls::ControlsView g_present_controls; // wanted = false until the host publishes
 
@@ -494,7 +497,9 @@ struct Service : std::enable_shared_from_this<Service> {
             drop(f);
             return;
         }
-        if (mailbox.size() == 2) {
+        // Newest-only keeps two; the queue keeps three, so a burst of frames
+        // inside one refresh is shown over the next ones rather than skipped.
+        if (mailbox.size() >= (g_present_fifo.load(std::memory_order_relaxed) ? 3u : 2u)) {
             auto old = std::find_if(mailbox.begin(), mailbox.end(),
                                     [](const auto &v) { return !v->capture; });
             if (old == mailbox.end()) {
@@ -731,14 +736,23 @@ struct Service : std::enable_shared_from_this<Service> {
             } else {
                 auto requested = std::find_if(mailbox.begin(), mailbox.end(),
                                               [](const auto &v) { return bool(v->capture); });
+                const bool fifo = g_present_fifo.load(std::memory_order_relaxed);
                 if (requested != mailbox.end()) {
                     f = *requested;
                     mailbox.erase(requested);
+                } else if (fifo) {
+                    // A game that draws at an uneven 40-50 frames a second
+                    // often seals two frames inside one refresh; showing only
+                    // the newest skipped the other and the animation hitched.
+                    // The rest stays queued for the next refresh (seal()
+                    // keeps at most three, so the delay stays within two frames).
+                    f = mailbox.front();
+                    mailbox.erase(mailbox.begin());
                 } else {
                     f = mailbox.back();
                     mailbox.pop_back();
                 }
-                for (auto it = mailbox.begin(); it != mailbox.end();) {
+                for (auto it = mailbox.begin(); !fifo && it != mailbox.end();) {
                     if ((*it)->capture) {
                         ++it;
                         continue;
@@ -1791,6 +1805,9 @@ extern "C" uint64_t host_display_epoch() {
     return host_present_transition_epoch();
 }
 
+void host_present_set_fifo(bool fifo) {
+    g_present_fifo.store(fifo);
+}
 void host_present_suspend(bool suspended) {
     g_present_suspended.store(suspended);
     if (!suspended)

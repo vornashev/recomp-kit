@@ -160,6 +160,11 @@ def load(game_dir):
     codepage = game.setdefault("ansi_codepage", 1252)
     if codepage not in (1251, 1252):
         raise ValueError("%s: [game] ansi_codepage must be 1251 or 1252, not %r" % (source, codepage))
+    # [present] fifo: show every frame the game draws once, oldest first,
+    # instead of only the newest at each refresh (up to two frames more latency).
+    fifo = cfg.setdefault("present", {}).setdefault("fifo", False)
+    if not isinstance(fifo, bool):
+        raise ValueError("%s: [present] fifo must be a boolean, not %r" % (source, fifo))
     translate = cfg.setdefault("translate", {})
     resumable = translate.setdefault("resumable_stacks", False)
     if not isinstance(resumable, bool):
