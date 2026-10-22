@@ -12,6 +12,7 @@
 #include "web_remote_fs.h"
 
 #include <emscripten/emscripten.h>
+#include <emscripten/threading.h>
 #include <emscripten/wasmfs.h>
 
 // WasmFS's own backend interface (system/lib/wasmfs).
@@ -32,7 +33,9 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -88,6 +91,9 @@ constexpr uint64_t CHUNK = 256u << 10;
 // The archives are read both ways: a movie or a map front to back, the
 // 677 MB resource archive a few kilobytes here and there.
 constexpr uint64_t MAX_AHEAD = 16;
+// The prefetcher's requests are kept short (1 MB), so one in flight is soon
+// out of the way of a read the game is waiting for.
+constexpr uint64_t PREFETCH_RUN = 4;
 
 std::string g_base_url, g_cache_dir;
 
@@ -111,6 +117,9 @@ std::vector<RamChunk> g_ram; // most recent last
 // Reads may come from more than one thread; the chunk cache is shared.
 std::mutex g_lock;
 uint64_t g_fetched_bytes = 0, g_fetches = 0;
+// Reads waiting on the network. The prefetcher starts nothing while one is:
+// the game's own request comes first.
+std::atomic<int> g_readers_waiting{0};
 
 const std::vector<uint8_t> *ram_find(RemoteFile *file, uint64_t index) {
     for (size_t i = g_ram.size(); i-- > 0;)
@@ -244,12 +253,67 @@ class RemoteFile : public DataFile {
             return hit;
         if (auto *hit = from_storage(index))
             return hit;
-        if (!fetch_run(index, until))
+        ++g_readers_waiting;
+        const bool fetched = fetch_run(index, until);
+        --g_readers_waiting;
+        if (!fetched)
             return nullptr;
         return ram_find(this, index);
     }
 
   public:
+    // For the prefetcher, all under g_lock. The first chunk from `*index` up
+    // to `last` that is neither stored nor in memory, and how far the missing
+    // run after it goes (at most PREFETCH_RUN chunks); false when none is.
+    bool next_missing(uint64_t *index, uint64_t last, uint64_t *end) {
+        load_cache();
+        last = std::min<uint64_t>(last, have_.size() - 1);
+        const auto present = [&](uint64_t k) {
+            if (have_[k])
+                return true;
+            for (const auto &r : g_ram)
+                if (r.file == this && r.index == k)
+                    return true;
+            return false;
+        };
+        while (*index <= last && present(*index))
+            ++*index;
+        if (*index > last)
+            return false;
+        *end = *index;
+        while (*end + 1 <= last && !present(*end + 1) && *end + 2 - *index <= PREFETCH_RUN)
+            ++*end;
+        return true;
+    }
+    uint64_t run_bytes(uint64_t index, uint64_t end) const {
+        return std::min<uint64_t>((end + 1) * CHUNK, size_) - index * CHUNK;
+    }
+    const std::string &rel() const {
+        return rel_;
+    }
+    // Keeps a run fetched outside the lock; chunks a reader stored meanwhile
+    // are left as they are.
+    void store(uint64_t index, const std::vector<uint8_t> &run) {
+        bool changed = false;
+        for (uint64_t k = index, at = 0; at < run.size() && k < have_.size(); ++k, at += CHUNK) {
+            if (have_[k] || !cache_ok_)
+                continue;
+            const size_t n = (size_t)chunk_len(k);
+            FILE *f = fopen(chunk_path(k).c_str(), "wb");
+            bool ok = f && fwrite(run.data() + at, 1, n, f) == n;
+            if (f && fclose(f) != 0)
+                ok = false;
+            if (!ok) {
+                cache_ok_ = false;
+                break;
+            }
+            have_[k] = 1;
+            changed = true;
+        }
+        if (changed)
+            save_map();
+    }
+
     RemoteFile(const std::string &rel, uint64_t size, uint64_t stamp, RemoteBackendId backend)
         : DataFile(S_IFREG | 0444, backend), rel_(rel), size_(size), stamp_(stamp),
           have_((size + CHUNK - 1) / CHUNK, 0) {}
@@ -299,6 +363,54 @@ class RemoteFile : public DataFile {
         return (ssize_t)done;
     }
 };
+
+// The hot list (<base>/hot.txt, "<path>\t<first chunk>\t<last chunk>" per
+// line): the chunks a session reads from the intro to the first map,
+// recorded once. A few threads fetch them in the background while the intro
+// plays, so the game finds them local instead of waiting on a request per
+// chunk. Only what is still missing is fetched, so a later visit costs
+// nothing.
+struct HotItem {
+    RemoteFile *file;
+    uint64_t first, last;
+};
+std::vector<HotItem> g_hot;
+std::atomic<size_t> g_hot_next{0};
+std::atomic<uint64_t> g_prefetched{0};
+std::atomic<int> g_prefetchers{0};
+
+void prefetch_worker() {
+    std::vector<uint8_t> run;
+    const double started = emscripten_get_now();
+    for (size_t i; (i = g_hot_next++) < g_hot.size();) {
+        const HotItem &h = g_hot[i];
+        for (uint64_t at = h.first;;) {
+            uint64_t end = 0, bytes = 0;
+            while (g_readers_waiting.load() > 0)
+                emscripten_thread_sleep(10);
+            {
+                std::lock_guard<std::mutex> hold(g_lock);
+                if (!h.file->next_missing(&at, h.last, &end))
+                    break;
+                bytes = h.file->run_bytes(at, end);
+            }
+            run.resize(bytes);
+            const std::string url = g_base_url + "/" + h.file->rel();
+            const double from = (double)(at * CHUNK);
+            if (remote_fetch_range(url.c_str(), from, from + (double)bytes - 1, run.data()) != (double)bytes)
+                break;
+            {
+                std::lock_guard<std::mutex> hold(g_lock);
+                h.file->store(at, run);
+            }
+            g_prefetched += bytes;
+            at = end + 1;
+        }
+    }
+    if (--g_prefetchers == 0)
+        fprintf(stderr, "[remote] hot list ready: %.1f MB fetched ahead in %.1f s\n",
+                g_prefetched.load() / 1e6, (emscripten_get_now() - started) / 1000.0);
+}
 
 class RemoteDirectory : public MemoryDirectory {
   public:
@@ -367,6 +479,7 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
         return false;
     }
     // "<size>\t<stamp>\t<path>" per line, '/'-separated paths under the root.
+    std::map<std::string, RemoteFile *> by_path;
     size_t files = 0;
     unsigned long long bytes = 0;
     for (char *line = strtok(manifest, "\n"); line; line = strtok(nullptr, "\n")) {
@@ -382,13 +495,34 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
         size_t at = 0;
         for (size_t slash; (slash = path.find('/', at)) != std::string::npos; at = slash + 1)
             dir = dir->subdir(path.substr(at, slash - at));
-        dir->add(path.substr(at), std::make_shared<RemoteFile>(path, size, stamp, id));
+        auto file = std::make_shared<RemoteFile>(path, size, stamp, id);
+        by_path[path] = file.get();
+        dir->add(path.substr(at), file);
         ++files;
         bytes += size;
     }
     free(manifest);
     fprintf(stderr, "[remote] %s: %zu files, %.0f MB, streamed from %s\n", mount, files, bytes / 1e6,
             g_base_url.c_str());
+    if (char *hot = remote_fetch_text((g_base_url + "/hot.txt").c_str())) {
+        for (char *line = strtok(hot, "\n"); line; line = strtok(nullptr, "\n")) {
+            char *tab1 = strchr(line, '\t');
+            char *tab2 = tab1 ? strchr(tab1 + 1, '\t') : nullptr;
+            if (!tab2)
+                continue;
+            *tab1 = 0;
+            auto it = by_path.find(line);
+            if (it != by_path.end())
+                g_hot.push_back({it->second, strtoull(tab1 + 1, nullptr, 10), strtoull(tab2 + 1, nullptr, 10)});
+        }
+        free(hot);
+        // Two requests in flight beside the game's own.
+        constexpr int THREADS = 2;
+        g_prefetchers = THREADS;
+        for (int i = 0; i < THREADS; ++i)
+            std::thread(prefetch_worker).detach();
+        fprintf(stderr, "[remote] fetching %zu hot ranges ahead\n", g_hot.size());
+    }
     return files > 0;
 }
 #endif

@@ -934,6 +934,8 @@ void ddraw_present(ComObj *s) {
         const bool fit = corner_only(px, s->pitch / 2, w, h, RECOMP_PRESENT_FIT_W, RECOMP_PRESENT_FIT_H);
         if (fit != g_fit_active) {
             g_fit_active = fit;
+            LOGW("ddraw: %s the %dx%d corner screen", fit ? "stretching" : "no longer stretching",
+                 RECOMP_PRESENT_FIT_W, RECOMP_PRESENT_FIT_H);
             win32_set_screen_view(fit ? RECOMP_PRESENT_FIT_W : 0, fit ? RECOMP_PRESENT_FIT_H : 0, w, h);
         }
         if (fit) {
