@@ -274,6 +274,9 @@ bool host_present_suspended(void);
 // Every sealed frame is shown once, oldest first, rather than only the newest
 // at each refresh: no game frame is skipped, at up to two frames of latency.
 void host_present_set_fifo(bool fifo);
+// Where the performance overlay sits (drawable pixels; a negative `left` is
+// the default top-right corner) and whether a page has hidden it.
+void host_present_set_overlay_place(int left, int top, bool hidden);
 void host_frame_seal(void);
 void host_present_first_write(void);
 void host_present_stage_rgba(const uint8_t *rgba, int w, int h);

@@ -65,6 +65,9 @@ def render_header(cfg):
     lines.append("#define RECOMP_GUEST_SIZE %s" % c_hex(game["guest_size"]))
     lines.append("#define RECOMP_ANSI_CODEPAGE %d" % game.get("ansi_codepage", 1252))
     lines.append("#define RECOMP_PRESENT_FIFO %d" % int(cfg.get("present", {}).get("fifo", False)))
+    corner = cfg.get("present", {}).get("fit_corner", [0, 0])
+    lines.append("#define RECOMP_PRESENT_FIT_W %d" % corner[0])
+    lines.append("#define RECOMP_PRESENT_FIT_H %d" % corner[1])
     lines.append("#define RECOMP_RESUMABLE_STACKS %d" %
                  int(cfg["translate"].get("resumable_stacks", False)))
     lines.append("#define RECOMP_CD_AUDIO_TRACKS %s" % c_string_list(cfg.get("media", {}).get("cd_tracks", [])))

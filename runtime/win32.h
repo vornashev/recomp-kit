@@ -349,6 +349,12 @@ void host_note_cadence(const char *kind);
 void host_post_message(uint32_t hwnd, uint32_t msg, uint32_t wparam, uint32_t lparam);
 // Queue host mouse input in virtual-screen coordinates, on the guest baton.
 void host_post_mouse_message(uint32_t msg, uint32_t mk, int32_t x, int32_t y);
+// While the presenter shows only the top-left view_w x view_h of a
+// screen_w x screen_h mode, stretched over all of it, host pointer positions
+// (which are in the stretched picture) are scaled back into that corner.
+// 0 for view_w turns it off.
+void win32_set_screen_view(int view_w, int view_h, int screen_w, int screen_h);
+void win32_screen_view_point(int32_t *x, int32_t *y);
 // The same routed event, starting in a specific window's client pixels.
 void host_post_client_mouse_message(uint32_t hwnd, uint32_t msg, uint32_t mk, int32_t x, int32_t y);
 // Post a keyboard message to the window that has the focus, which is where

@@ -10,6 +10,7 @@
 #include "../platform/os.h"
 #include "memory.h"
 
+#include <atomic>
 #include <array>
 #include <deque>
 #include <map>
@@ -165,7 +166,25 @@ void host_set_key_state(int vk, bool down) {
     if (vk >= 0 && vk < 256)
         g_key_state[vk] = down ? 0x80 : 0x00;
 }
+namespace {
+std::atomic<int> g_view_w{0}, g_view_h{0}, g_screen_w{0}, g_screen_h{0};
+}
+void win32_set_screen_view(int view_w, int view_h, int screen_w, int screen_h) {
+    g_view_h = view_h;
+    g_screen_w = screen_w;
+    g_screen_h = screen_h;
+    g_view_w = view_w; // last: the reader checks it first
+}
+void win32_screen_view_point(int32_t *x, int32_t *y) {
+    const int vw = g_view_w.load(), sw = g_screen_w.load(), vh = g_view_h.load(),
+              sh = g_screen_h.load();
+    if (vw <= 0 || sw <= 0 || sh <= 0)
+        return;
+    *x = int32_t(int64_t(*x) * vw / sw);
+    *y = int32_t(int64_t(*y) * vh / sh);
+}
 void host_set_cursor_pos(int32_t x, int32_t y) {
+    win32_screen_view_point(&x, &y);
     g_cursor_x = x;
     g_cursor_y = y;
 }

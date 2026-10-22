@@ -94,7 +94,7 @@ void PerformanceOverlay::update(gpu::Device *device, const FramePacingSnapshot &
 
 void PerformanceOverlay::draw(gpu::Device *device, gpu::CommandBuffer cb, gpu::Texture target,
                               int w, int h, const FramePacingSnapshot &s, double now, int mode,
-                              int limit) {
+                              int limit, int left, int top) {
     if (!mode || !device || !target || !cb || w <= 0 || h <= 0)
         return;
     if (!texture_ || mode != last_mode_ || now - refreshed_ >= .25 || device_ != device) {
@@ -115,7 +115,8 @@ void PerformanceOverlay::draw(gpu::Device *device, gpu::CommandBuffer cb, gpu::T
         return;
     const double scale = std::clamp(double(h) / 900.0, 1.0, 3.0);
     const double ow = std::min(double(w) - 20, width * scale), oh = texture_h_ * (ow / width);
-    float rect[] = {float(1 - 2 * (ow + 10) / w), float(1 - 20.0 / h), float(2 * ow / w),
+    const double x = left >= 0 ? left : w - ow - 10, y = top >= 0 ? top : 10;
+    float rect[] = {float(-1 + 2 * x / w), float(1 - 2 * y / h), float(2 * ow / w),
                     float(-2 * oh / h)};
     gpu::RenderPass pass;
     pass.color_count = 1;

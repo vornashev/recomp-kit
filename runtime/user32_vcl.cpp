@@ -6,6 +6,7 @@
 #include "gdi_image.h"
 #include "../platform/os.h"
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <vector>
 #include <cstring>
@@ -115,7 +116,9 @@ void pump_mouse_input(X86 *c) {
         if (!w)
             return;
     }
-    host_set_cursor_pos(input.x, input.y);
+    // Already in guest screen points (host_post_mouse_message mapped them).
+    g_cursor_x = input.x;
+    g_cursor_y = input.y;
     bool press = input.message == 0x201 || input.message == 0x204 || input.message == 0x207;
     if (!capture && press && top != active) {
         uint32_t result = host_dispatch_to_wndproc(c, hwnd, 0x21, top, (input.message << 16) | 1);
@@ -138,8 +141,32 @@ void pump_mouse_input(X86 *c) {
     uint32_t lp = (uint32_t(uint16_t(int64_t(input.y) - y)) << 16) | uint16_t(int64_t(input.x) - x);
     LOGV("host mouse %04x screen=(%d,%d) -> hwnd=%08x client=(%d,%d) mk=%x", input.message, input.x,
          input.y, hwnd, int16_t(lp), int16_t(lp >> 16), input.mk);
-    queue().push_back(
-        {hwnd, input.message, input.mk, lp, input.time, uint32_t(input.x), uint32_t(input.y)});
+    // Windows turns a second press of the same button into WM_xBUTTONDBLCLK
+    // (press + 2) when it comes within the double-click time and rectangle
+    // (500 ms, 4x4 pixels) on the same window, and that window's class asked
+    // for it with CS_DBLCLKS. The host only reports presses, so the runtime
+    // does the same: Heroes IV opens heroes, towns and armies by double-click.
+    uint32_t message = input.message;
+    if (press) {
+        static uint32_t last_message = 0, last_time = 0, last_hwnd = 0;
+        static int32_t last_x = 0, last_y = 0;
+        const Window *w = find_window(hwnd);
+        auto cls = w ? classes().find(w->cls) : classes().end();
+        const bool wants = cls != classes().end() && (cls->second.style & 0x8); // CS_DBLCLKS
+        if (wants && message == last_message && hwnd == last_hwnd &&
+            input.time - last_time <= 500 && std::abs(input.x - last_x) <= 2 &&
+            std::abs(input.y - last_y) <= 2) {
+            message += 2;
+            last_message = 0; // a third press starts over
+        } else {
+            last_message = message;
+            last_time = input.time;
+            last_hwnd = hwnd;
+            last_x = input.x;
+            last_y = input.y;
+        }
+    }
+    queue().push_back({hwnd, message, input.mk, lp, input.time, uint32_t(input.x), uint32_t(input.y)});
 }
 // Queue each expired timer at most once. Signed subtraction handles DWORD
 // clock wrap; no host thread mutates guest memory or invokes a callback here.
@@ -1546,6 +1573,7 @@ void host_post_mouse_message(uint32_t msg, uint32_t mk, int32_t x, int32_t y) {
         mk |= 8;
     if (msg < 0x200 || msg > 0x209)
         return;
+    win32_screen_view_point(&x, &y);
     // A mouse move is a position, not an event. Windows does not queue one per
     // motion the hardware reports: it keeps the latest and synthesises the
     // message when the guest asks. The routing pump below delivers one message

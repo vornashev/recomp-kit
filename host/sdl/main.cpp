@@ -1572,6 +1572,8 @@ namespace {
 
 std::string g_web_exe;
 std::atomic<bool> g_web_guest_done{false};
+// The player page's button for the performance overlay (web/player/index.html).
+std::atomic<bool> g_web_overlay_hidden{false};
 int g_web_dw = 0, g_web_dh = 0;
 
 void web_tick() {
@@ -1603,6 +1605,10 @@ void web_frame() {
         host_present_resize(dw, dh);
         host_display_set_screen(dw, dh);
     }
+    // The overlay sits in the top-left corner, under the page's button
+    // (8 CSS pixels in, 44 down), in drawable pixels.
+    const double dpr = emscripten_get_device_pixel_ratio();
+    host_present_set_overlay_place(int(8 * dpr), int(44 * dpr), g_web_overlay_hidden.load());
     host_d9_pump();
     host_present_pump();
     host_d9_frame(false);
@@ -1629,6 +1635,14 @@ void web_frame() {
             code);
         emscripten_cancel_main_loop();
     }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void recomp_web_overlay_hidden(int hidden) {
+    g_web_overlay_hidden.store(hidden != 0);
+}
+// 0 when the overlay is off in the settings, so the page hides its button.
+extern "C" EMSCRIPTEN_KEEPALIVE int recomp_web_overlay_mode() {
+    return mods_display_overlay();
 }
 
 // The game's thread: the game's files are read from here, never from the

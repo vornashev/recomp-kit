@@ -13,8 +13,11 @@ class PerformanceOverlay {
     ~PerformanceOverlay();
     // Blend the overlay onto `target` (drawable pixels `w` x `h`) inside `cb`.
     // `mode` 0 draws nothing, 1 the counters, 2 the counters and the graph.
+    // `left`/`top` place its top-left corner in drawable pixels; a negative
+    // `left` keeps it in the top-right corner.
     void draw(gpu::Device *device, gpu::CommandBuffer cb, gpu::Texture target, int w, int h,
-              const FramePacingSnapshot &s, double now, int mode, int limit);
+              const FramePacingSnapshot &s, double now, int mode, int limit, int left = -1,
+              int top = -1);
 
   private:
     static constexpr int width = 330, height = 136;

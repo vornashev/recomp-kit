@@ -165,6 +165,11 @@ def load(game_dir):
     fifo = cfg.setdefault("present", {}).setdefault("fifo", False)
     if not isinstance(fifo, bool):
         raise ValueError("%s: [present] fifo must be a boolean, not %r" % (source, fifo))
+    # [present] fit_corner = [w, h]: a screen drawn only in the top-left w x h
+    # of a larger mode (the rest black) is shown stretched to the whole mode.
+    corner = cfg["present"].setdefault("fit_corner", [0, 0])
+    if not (isinstance(corner, list) and len(corner) == 2 and all(isinstance(v, int) and v >= 0 for v in corner)):
+        raise ValueError("%s: [present] fit_corner must be [width, height], not %r" % (source, corner))
     translate = cfg.setdefault("translate", {})
     resumable = translate.setdefault("resumable_stacks", False)
     if not isinstance(resumable, bool):

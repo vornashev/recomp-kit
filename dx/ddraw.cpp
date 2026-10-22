@@ -841,6 +841,59 @@ void surface_pixels_changed(ComObj *s) {
         s->tex_dirty = true; // no handle yet; GetHandle will send them
 }
 
+// [present] fit_corner. Heroes IV draws its 800x600 screens - the intro
+// movies in their frame, the campaign briefings - in the top-left corner of
+// its 1024x768 mode and leaves the rest black. When a 16-bit frame is exactly
+// that, the corner is stretched over the whole mode (the same 4:3 shape), and
+// pointer positions are scaled back into it so clicks land where they show.
+namespace {
+#ifndef RECOMP_PRESENT_FIT_W
+#define RECOMP_PRESENT_FIT_W 0
+#define RECOMP_PRESENT_FIT_H 0
+#endif
+std::vector<uint16_t> g_fit_pixels;
+bool g_fit_active = false;
+
+bool corner_only(const uint16_t *px, uint32_t pitch16, int w, int h, int cw, int ch) {
+    for (int y = 0; y < h; ++y) {
+        const uint16_t *row = px + size_t(y) * pitch16;
+        for (int x = y < ch ? cw : 0; x < w; ++x)
+            if (row[x])
+                return false;
+    }
+    for (int y = 0; y < ch; y += 7) // something is drawn in the corner
+        for (int x = 0; x < cw; x += 7)
+            if (px[size_t(y) * pitch16 + x])
+                return true;
+    return false;
+}
+// Bilinear, in RGB565, the corner (cw x ch) onto w x h.
+void stretch_corner(const uint16_t *px, uint32_t pitch16, int cw, int ch, int w, int h,
+                    uint16_t *out) {
+    for (int y = 0; y < h; ++y) {
+        const uint32_t fy = uint32_t((uint64_t(y) * (ch - 1) << 16) / std::max(1, h - 1));
+        const int y0 = int(fy >> 16), y1 = std::min(y0 + 1, ch - 1);
+        const uint32_t wy = (fy >> 8) & 0xff;
+        const uint16_t *r0 = px + size_t(y0) * pitch16, *r1 = px + size_t(y1) * pitch16;
+        uint16_t *dst = out + size_t(y) * w;
+        for (int x = 0; x < w; ++x) {
+            const uint32_t fx = uint32_t((uint64_t(x) * (cw - 1) << 16) / std::max(1, w - 1));
+            const int x0 = int(fx >> 16), x1 = std::min(x0 + 1, cw - 1);
+            const uint32_t wx = (fx >> 8) & 0xff;
+            const uint32_t p[4] = {r0[x0], r0[x1], r1[x0], r1[x1]};
+            const uint32_t k[4] = {(256 - wx) * (256 - wy), wx * (256 - wy), (256 - wx) * wy, wx * wy};
+            uint32_t r = 0, g = 0, b = 0;
+            for (int i = 0; i < 4; ++i) {
+                r += (p[i] >> 11) * k[i];
+                g += ((p[i] >> 5) & 63) * k[i];
+                b += (p[i] & 31) * k[i];
+            }
+            dst[x] = uint16_t(((r + 32768) >> 16) << 11 | ((g + 32768) >> 16) << 5 | ((b + 32768) >> 16));
+        }
+    }
+}
+} // namespace
+
 void ddraw_present(ComObj *s) {
     if (!s || s->kind != K_SURFACE || !s->pixels)
         return;
@@ -874,6 +927,23 @@ void ddraw_present(ComObj *s) {
     // A media session on screen owns it, exactly as a video renderer's own
     // window would: presenting the primary here as well would put the game's
     // drawing over most of the movie's frames.
+    if (RECOMP_PRESENT_FIT_W > 0 && s->bpp == 16 && (int)s->width > RECOMP_PRESENT_FIT_W &&
+        (int)s->height > RECOMP_PRESENT_FIT_H && !mf_owns_the_screen()) {
+        const int w = (int)s->width, h = (int)s->height;
+        const uint16_t *px = (const uint16_t *)gm_ptr(s->pixels);
+        const bool fit = corner_only(px, s->pitch / 2, w, h, RECOMP_PRESENT_FIT_W, RECOMP_PRESENT_FIT_H);
+        if (fit != g_fit_active) {
+            g_fit_active = fit;
+            win32_set_screen_view(fit ? RECOMP_PRESENT_FIT_W : 0, fit ? RECOMP_PRESENT_FIT_H : 0, w, h);
+        }
+        if (fit) {
+            g_fit_pixels.resize(size_t(w) * h);
+            stretch_corner(px, s->pitch / 2, RECOMP_PRESENT_FIT_W, RECOMP_PRESENT_FIT_H, w, h,
+                           g_fit_pixels.data());
+            host_present((const uint8_t *)g_fit_pixels.data(), w, h, 16, nullptr, w * 2);
+            return;
+        }
+    }
     if (!mf_owns_the_screen())
         host_present(gm_ptr(s->pixels), (int)s->width, (int)s->height, (int)s->bpp,
                      pal ? pal->pal : nullptr, (int)s->pitch);

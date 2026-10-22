@@ -6160,6 +6160,41 @@ static void test_host_mouse_routing() {
                   rd32(msg) != 0,
               "and reaches some window when nothing holds the focus");
     }
+    // A second quick press on a CS_DBLCLKS window is WM_LBUTTONDBLCLK, and a
+    // third starts over; a class without the style never sees one.
+    {
+        memset(g_mem + s + 0x400, 0, 40);
+        wr32(s + 0x400, 0x8); // CS_DBLCLKS
+        wr32(s + 0x404, proc);
+        gm_put_wstr(s + 0x500, "DoubleClicks", 32);
+        wr32(s + 0x424, s + 0x500);
+        call_import(&c, "USER32.dll", "RegisterClassW", {s + 0x400});
+        uint32_t dbl = call_import(&c, "USER32.dll", "CreateWindowExW",
+                                   {8, s + 0x500, 0, 0x10000000, 400, 400, 100, 100, 0, 0, IMAGE_BASE, 0});
+        call_import(&c, "USER32.dll", "SetActiveWindow", {dbl});
+        while (call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x209, 1}))
+            ;
+        std::vector<uint32_t> got;
+        for (uint32_t m : {0x201u, 0x202u, 0x201u, 0x202u, 0x201u, 0x202u}) {
+            host_post_mouse_message(m, m == 0x201 ? 1 : 0, 450, 450);
+            if (call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x209, 1}))
+                got.push_back(rd32(msg + 4));
+        }
+        check(got == std::vector<uint32_t>{0x201, 0x202, 0x203, 0x202, 0x201, 0x202},
+              "a second quick press is a double-click on a CS_DBLCLKS window");
+        activate_result = 1;
+        call_import(&c, "USER32.dll", "SetWindowPos", {top, 0xffffffffu, 0, 0, 0, 0, 3});
+        call_import(&c, "USER32.dll", "SetActiveWindow", {top});
+        got.clear();
+        for (uint32_t m : {0x201u, 0x201u}) {
+            host_post_mouse_message(m, 1, 125, 150);
+            if (call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0x200, 0x209, 1}))
+                got.push_back(rd32(msg + 4));
+        }
+        check(got == std::vector<uint32_t>{0x201, 0x201},
+              "and a class without CS_DBLCLKS gets two presses");
+        call_import(&c, "USER32.dll", "DestroyWindow", {dbl});
+    }
     for (uint32_t w : {top, ordinary, hidden, disabled})
         call_import(&c, "USER32.dll", "DestroyWindow", {w});
 }

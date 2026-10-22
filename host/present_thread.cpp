@@ -61,6 +61,10 @@ static std::atomic<bool> g_present_suspended{false};
 // Show every sealed frame once, oldest first, instead of only the newest
 // (host_present_set_fifo). Costs up to two frames of latency.
 std::atomic<bool> g_present_fifo{false};
+// The performance overlay's placement and a page's hide button
+// (host_present_set_overlay_place).
+std::atomic<int> g_overlay_left{-1}, g_overlay_top{-1};
+std::atomic<bool> g_overlay_hidden{false};
 static std::mutex g_present_controls_mutex;
 static controls::ControlsView g_present_controls; // wanted = false until the host publishes
 
@@ -899,8 +903,10 @@ struct Service : std::enable_shared_from_this<Service> {
                             (unsigned long long)snapshot.drops);
                 }
                 performance_overlay.draw(device, cb, drawable, drawable_desc.width,
-                                         drawable_desc.height, snapshot, ts, mods_display_overlay(),
-                                         mods_display_fps());
+                                         drawable_desc.height, snapshot, ts,
+                                         g_overlay_hidden.load() ? 0 : mods_display_overlay(),
+                                         mods_display_fps(), g_overlay_left.load(),
+                                         g_overlay_top.load());
                 const controls::ControlsView controls_view = host_present_controls();
                 if (controls_view.wanted)
                     controls_overlay.draw(device, cb, drawable, drawable_desc.width,
@@ -1805,6 +1811,11 @@ extern "C" uint64_t host_display_epoch() {
     return host_present_transition_epoch();
 }
 
+void host_present_set_overlay_place(int left, int top, bool hidden) {
+    g_overlay_left.store(left);
+    g_overlay_top.store(top);
+    g_overlay_hidden.store(hidden);
+}
 void host_present_set_fifo(bool fifo) {
     g_present_fifo.store(fifo);
 }
