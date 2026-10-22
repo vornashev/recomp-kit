@@ -1,6 +1,9 @@
 // Shared canvas state. Access only under the guest scheduler baton. Guest DIB
 // addresses stay in the arena; window surfaces own top-down ARGB host pixels.
 #pragma once
+#include <algorithm>
+#include <cstdint>
+#include <climits>
 #include "gdi_image.h"
 #include "imports.h"
 #include <array>
@@ -33,6 +36,15 @@ struct DeviceContext : DcState {
     // taken when the DC is made. Writes there are dropped.
     std::vector<Rect> excluded;
     std::vector<DcState> saved;
+    // The device-space box everything drawn through this DC has covered, so
+    // a DirectDraw ReleaseDC compares only those rows with its baseline.
+    int64_t written[4] = {INT64_MAX, INT64_MAX, INT64_MIN, INT64_MIN};
+    void note_written(int64_t l, int64_t t, int64_t r, int64_t b) {
+        written[0] = std::min(written[0], l);
+        written[1] = std::min(written[1], t);
+        written[2] = std::max(written[2], r);
+        written[3] = std::max(written[3], b);
+    }
 };
 struct Object {
     enum Kind { Brush, Pen, Font, Region } kind = Brush;
@@ -55,6 +67,10 @@ bool dc_has_alpha(uint32_t dc);
 // colour and monochrome rather than matching the nearest palette entry.
 bool dc_is_monochrome(uint32_t dc);
 bool read_pixel(uint32_t dc, int64_t x, int64_t y, uint32_t *pixel, bool preserve_alpha = false);
+// SRCCOPY of a w x h rectangle between two same-format DIB-backed DCs with no
+// clip regions; false (nothing written) when the general per-pixel path is needed.
+bool copy_dib_rect(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src,
+                   int32_t sx, int32_t sy);
 // MaskBlt's mask: true with *set written when `bitmap` is a 1-bit bitmap and
 // (x, y) is inside it. A set bit selects the foreground raster operation.
 bool mask_bit(uint32_t bitmap, int64_t x, int64_t y, bool *set);
@@ -75,6 +91,9 @@ void gdi_destroy_window(uint32_t window);
 void gdi_bind_surface_dc(uint32_t dc, int w, int h, int bpp, uint32_t pitch, uint32_t bits,
                          const uint32_t *palette);
 void gdi_unbind_surface_dc(uint32_t dc);
+// The rows [first, last] GDI wrote through `dc` since it was bound; false when
+// it wrote nothing.
+bool gdi_written_rows(uint32_t dc, int32_t *first, int32_t *last);
 namespace gdi {
 Rect to_device(uint32_t dc, Rect rect);
 }

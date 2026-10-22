@@ -265,10 +265,17 @@ void recomp_unknown_call(X86 *c, uint32_t target) {
 }
 
 // DIV/IDIV with a zero divisor or an out-of-range quotient. On real hardware
-// this raises #DE; there is no SEH here, so it is reported and the registers
-// are left untouched.
-void recomp_div_error(X86 *c, uint32_t addr) {
-    LOGW("divide error at %08x (EAX=%08x EDX=%08x)", addr, c->r[R_EAX], c->r[R_EDX]);
+// this raises #DE, which Windows hands the program's handlers as
+// EXCEPTION_INT_DIVIDE_BY_ZERO or EXCEPTION_INT_OVERFLOW - and an MSVC
+// catch(...) of that era takes it. Running on past the instruction instead
+// took Heroes IV, whose random-artifact pick divides by an empty candidate
+// count, into an out-of-range index and an uncaught throw. When no handler
+// takes it the registers are left untouched and the run carries on, as before.
+void recomp_div_error(X86 *c, uint32_t addr, int overflow) {
+    const uint32_t code = overflow ? 0xc0000095u : 0xc0000094u;
+    LOGW("divide error at %08x (EAX=%08x EDX=%08x): raising %08x for the guest's handlers", addr,
+         c->r[R_EAX], c->r[R_EDX], code);
+    recomp_seh_raise(c, code, 0, 0, 0);
 }
 
 // A read or a write through a pointer in the first 64 KB. Windows maps

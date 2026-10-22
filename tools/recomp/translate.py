@@ -1649,6 +1649,74 @@ def seh_frame_sites(fn, image=None):
                     break
         except TranslateError:
             continue
+    sites.update(msvc_frame_sites(fn, sites))
+    return sites
+
+
+def msvc_frame_sites(fn, known):
+    """MSVC's establishment: the chain head is loaded into a register first,
+    pushed as the record's `next`, then ESP is published:
+
+        PUSH -1 / PUSH handler / MOV EAX,FS:[0] / PUSH EAX / MOV FS:[0],ESP
+
+    The compiler may hoist the load above the PUSHes or schedule unrelated
+    instructions between the PUSH and the publishing MOV, so walk back over a
+    short contiguous span: the first stack write must be PUSH reg (`next`),
+    that register must hold FS:[0] from an earlier load with no write in
+    between, and the nearest PUSH before it is the handler immediate (the C++
+    frame stub, or _except_handler3 after its scope table)."""
+    sites = {}
+    for i, ins in enumerate(fn.insns):
+        if i in known or ins.mnem != "MOV" or len(ins.ops) != 2:
+            continue
+        try:
+            dst, src = [parse_operand(o) for o in ins.ops]
+        except TranslateError:
+            continue
+        if (not seh_chain_operand(dst) or dst.base is not None or src.kind != "reg"
+                or src.reg != R_ESP or src.size != 32):
+            continue
+        next_reg = None
+        loaded = False
+        handler = None
+        for j in range(i - 1, max(-1, i - 9), -1):
+            if not fn.contiguous[j]:
+                break
+            prev = fn.insns[j]
+            try:
+                ops = [parse_operand(o) for o in prev.ops]
+            except TranslateError:
+                break
+            if next_reg is None:
+                if prev.mnem == "PUSH":
+                    if len(ops) != 1 or ops[0].kind != "reg" or ops[0].size != 32 or ops[0].reg == R_ESP:
+                        break
+                    next_reg = ops[0].reg
+                    continue
+                if (prev.mnem in ("POP", "CALL", "PUSHAD", "POPAD", "LEAVE", "ENTER")
+                        or Translator.writes_reg32(prev, R_ESP)):
+                    break
+                continue
+            # The listing spells the load MOV EAX,FS:[0x0], with no operand size.
+            src_op = ops[1] if len(ops) == 2 else None
+            if (not loaded and prev.mnem == "MOV" and src_op is not None and ops[0].kind == "reg"
+                    and ops[0].reg == next_reg and ops[0].size == 32 and src_op.kind == "mem"
+                    and src_op.seg == "FS" and src_op.base is None and src_op.index is None
+                    and src_op.disp == 0 and src_op.size in (None, 32)):
+                loaded = True
+                if handler is not None:
+                    break
+                continue
+            if not loaded and Translator.writes_reg32(prev, next_reg):
+                break
+            if prev.mnem == "PUSH" and handler is None:
+                if len(ops) != 1 or ops[0].kind != "imm":
+                    break
+                handler = ops[0].imm & 0xffffffff
+                if loaded:
+                    break
+        if next_reg is not None and loaded and handler is not None:
+            sites[i] = handler
     return sites
 
 

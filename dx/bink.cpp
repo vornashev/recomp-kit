@@ -691,6 +691,22 @@ void BinkGetError(X86 *c) {
     set_eax(c, g_error_string);
 }
 
+// BinkGetSummary(bink, summary): the playback statistics record. Width,
+// height and the frame count come from the guest's own Bink record (+0, +4,
+// +8); the timing counters stay zero.
+void BinkGetSummary(X86 *c) {
+    uint32_t rec = arg(c, 0), sum = arg(c, 1);
+    if (sum && gm_valid(sum, 0x60)) {
+        memset(g_mem + sum, 0, 0x60);
+        if (rec && gm_valid(rec, 12)) {
+            wr32(sum + 0x00, rd32(rec + 0x00));
+            wr32(sum + 0x04, rd32(rec + 0x04));
+            wr32(sum + 0x20, rd32(rec + 0x08)); // TotalFrames
+        }
+    }
+    set_eax(c, 0);
+}
+
 #define BINK(name, bytes, fn) {"binkw32.dll", "_Bink" #name "@" #bytes, (bytes) / 4, fn}
 #define SMACK(name, bytes, fn) {"smackw32.dll", "_Smack" #name "@" #bytes, (bytes) / 4, fn}
 
@@ -699,6 +715,9 @@ const ImportShim g_video_shims[] = {
     BINK(GetRects, 8, BinkGetRects),
     BINK(Pause, 8, BinkPause),
     BINK(Open, 8, BinkOpen),
+    BINK(GetSummary, 8, BinkGetSummary),
+    BINK(SetSoundTrack, 4, ret0),
+    BINK(SetVolume, 8, ret0), // Heroes IV: movie volume; the mixer level applies
     BINK(OpenMiles, 4, ret0),
     BINK(SetSoundSystem, 8, ret1),
     BINK(DDSurfaceType, 4, BinkDDSurfaceType),

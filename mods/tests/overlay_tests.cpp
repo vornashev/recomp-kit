@@ -139,20 +139,46 @@ MOD_TEST_SUITE(overlay_deletes_reach_the_profile_only) {
     // and a delete test that ran after it would be deleting that copy rather
     // than proving anything about the tier below.
     layers();
-    // A file only a mod has: nothing in the profile to delete, and v1 has no
-    // tombstones, so it cannot be hidden either.
-    MOD_CHECK(win32_host_path_op("data\\fromb.txt", WIN32_FILE_DELETE).empty());
-    MOD_CHECK(win32_host_path_op("levels\\levl2001.dat", WIN32_FILE_DELETE).empty());
-    MOD_CHECK(read_file(win32_host_path_op("data\\fromb.txt", WIN32_FILE_READ)) == "b");
-    // A file the profile does have deletes from there, and the mod's copy is
-    // then what a read finds.
-    write_file(std::string(mods_overlay_profile_dir()) + "/data/fromb.txt", "profile-b");
-    win32_invalidate_dir_cache();
-    std::string mine = win32_host_path_op("data\\fromb.txt", WIN32_FILE_DELETE);
+    // A file the profile has deletes from there, and the mod's copy is then
+    // what a read finds.
+    std::string mine = win32_host_path_op("data\\shared.txt", WIN32_FILE_DELETE);
     MOD_CHECK(mine.find(mods_overlay_profile_dir()) == 0);
     os_unlink(mine.c_str());
     win32_invalidate_dir_cache();
-    MOD_CHECK(read_file(win32_host_path_op("data\\fromb.txt", WIN32_FILE_READ)) == "b");
+    MOD_CHECK(read_file(win32_host_path_op("data\\shared.txt", WIN32_FILE_READ)) == "mod-b");
+    // A file only a lower tier has is never touched there: the delete removes
+    // a profile placeholder and leaves a whiteout, so the name is gone - as a
+    // game that deletes its old save before writing the new one expects.
+    std::string hidden = win32_host_path_op("data\\fromb.txt", WIN32_FILE_DELETE);
+    MOD_CHECK(hidden.find(mods_overlay_profile_dir()) == 0);
+    MOD_CHECK(os_unlink(hidden.c_str()) == 0);
+    win32_invalidate_dir_cache();
+    MOD_CHECK(win32_host_path_op("data\\fromb.txt", WIN32_FILE_READ).empty());
+    MOD_CHECK(read_file(std::string(ROOT) + "/modb/data/FROMB.TXT") == "b");
+    std::vector<std::pair<std::string, std::string>> listed;
+    mods_cpp_overlay_list("data", &listed);
+    bool lists_fromb = false, lists_marker = false;
+    for (const auto &kv : listed) {
+        lists_fromb = lists_fromb || kv.first == "FROMB.TXT";
+        lists_marker = lists_marker || kv.first.find(".pop-whiteout-") == 0;
+    }
+    MOD_CHECK(!lists_fromb && !lists_marker);
+    MOD_CHECK(win32_host_path_op("data\\fromb.txt", WIN32_FILE_DELETE).empty());
+    // Writing the name again brings it back, empty rather than copied up.
+    std::string again = win32_host_path_op("data\\fromb.txt", WIN32_FILE_WRITE);
+    MOD_CHECK(again.find(mods_overlay_profile_dir()) == 0);
+    write_file(again, "new");
+    win32_invalidate_dir_cache();
+    MOD_CHECK(read_file(win32_host_path_op("data\\fromb.txt", WIN32_FILE_READ)) == "new");
+    // A rename of a lower tier's file copies it up and hides the old name.
+    std::string from = win32_host_path_op("data\\froma.txt", WIN32_FILE_RENAME_SRC);
+    std::string to = win32_host_path_op("data\\renamed.txt", WIN32_FILE_RENAME_DST);
+    MOD_CHECK(from.find(mods_overlay_profile_dir()) == 0 && to.find(mods_overlay_profile_dir()) == 0);
+    MOD_CHECK(os_rename(from.c_str(), to.c_str()) == 0);
+    win32_invalidate_dir_cache();
+    MOD_CHECK(win32_host_path_op("data\\froma.txt", WIN32_FILE_READ).empty());
+    MOD_CHECK(read_file(win32_host_path_op("data\\renamed.txt", WIN32_FILE_READ)) == "a");
+    MOD_CHECK(read_file(std::string(ROOT) + "/moda/data/froma.txt") == "a");
     // A rename destination is a write, so it lands in the profile too.
     MOD_CHECK(win32_host_path_op("data\\newsave.dat", WIN32_FILE_RENAME_DST)
                   .find(mods_overlay_profile_dir()) == 0);
@@ -226,8 +252,6 @@ MOD_TEST_SUITE(overlay_guest_mutations) {
     loader_init_context(c);
     uint32_t from = mod_test_put_str("DATA\\FROMA.TXT");
     uint32_t to = mod_test_put_str("saves\\slot2\\new.dat");
-    MOD_CHECK_EQ(mod_test_call_import(c, "KERNEL32.dll", "DeleteFileA", {from}), 0u);
-    MOD_CHECK_EQ(mod_test_call_import(c, "KERNEL32.dll", "MoveFileA", {from, to}), 0u);
     MOD_CHECK_EQ(mod_test_call_import(c, "KERNEL32.dll", "CopyFileA", {from, to, 1}), 1u);
     MOD_CHECK(read_file(std::string(ROOT) + "/profile/saves/slot2/new.dat") == "a");
     // Destination exists only below the profile: fail-if-exists must not see
@@ -249,6 +273,17 @@ MOD_TEST_SUITE(overlay_guest_mutations) {
     MOD_CHECK_EQ(rd32(count), 9u);
     mod_test_call_import(c, "KERNEL32.dll", "CloseHandle", {h});
     MOD_CHECK(read_file(win32_host_path_op("data\\froma.txt", WIN32_FILE_READ)) == "rewritten");
+    MOD_CHECK(read_file(std::string(ROOT) + "/moda/data/froma.txt") == "a");
+
+    // Deleting the profile's copy shows the mod's again; deleting the name
+    // when only the mod has it hides it (a whiteout), and the mod's file is
+    // untouched either way.
+    MOD_CHECK_EQ(mod_test_call_import(c, "KERNEL32.dll", "DeleteFileA", {from}), 1u);
+    MOD_CHECK(read_file(win32_host_path_op("data\\froma.txt", WIN32_FILE_READ)) == "a");
+    MOD_CHECK_EQ(mod_test_call_import(c, "KERNEL32.dll", "DeleteFileA", {from}), 1u);
+    MOD_CHECK(win32_host_path_op("data\\froma.txt", WIN32_FILE_READ).empty());
+    MOD_CHECK_EQ(mod_test_call_import(c, "KERNEL32.dll", "DeleteFileA", {from}), 0u);
+    MOD_CHECK_EQ(mod_test_call_import(c, "KERNEL32.dll", "MoveFileA", {from, to}), 0u);
     MOD_CHECK(read_file(std::string(ROOT) + "/moda/data/froma.txt") == "a");
 }
 

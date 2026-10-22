@@ -868,6 +868,22 @@ struct Service : std::enable_shared_from_this<Service> {
                     std::lock_guard lock(mutex);
                     snapshot = pacing.snapshot(ts, drops);
                 }
+                // RECOMP_PACING_LOG=<seconds>: the overlay's numbers as text, for
+                // comparing builds without reading them off a screenshot.
+                static const double pacing_every = [] {
+                    const char *v = recomp_env("PACING_LOG");
+                    return v ? atof(v) : 0.0;
+                }();
+                static double pacing_last = 0;
+                if (pacing_every > 0 && ts - pacing_last >= pacing_every) {
+                    pacing_last = ts;
+                    fprintf(stderr,
+                            "[pacing] new %.1f fps, display %.1f, median %.1f ms, p95 %.1f ms, "
+                            "repeat %.0f%%, drops %llu\n",
+                            snapshot.new_fps, snapshot.display_fps, snapshot.median_ms,
+                            snapshot.p95_ms, snapshot.repeat_percent,
+                            (unsigned long long)snapshot.drops);
+                }
                 performance_overlay.draw(device, cb, drawable, drawable_desc.width,
                                          drawable_desc.height, snapshot, ts, mods_display_overlay(),
                                          mods_display_fps());

@@ -369,7 +369,11 @@ static void trace_state(const char *what) {
 }
 void apply_pointer_capture(bool want) {
     // No pointer to capture on a touch platform: fingers are placed absolutely.
-    want = want && platform_ui_pointer_capture_supported();
+    // Nor for a game that reads absolute positions from its window messages
+    // and draws its own cursor ([controls] pointer_capture = false): capture
+    // switches the host to relative motion, and confining the pointer makes
+    // SDL synthesize a motion event that tells the guest the mouse left.
+    want = want && platform_ui_pointer_capture_supported() && RECOMP_CONTROLS_POINTER_CAPTURE;
     host_pointer_capture(want);
     // Queue draining can run on a guest worker. All native cursor/window work
     // belongs to the main thread, which observes this at the next pump.
@@ -411,6 +415,19 @@ bool pointer_capture_wanted() {
 }
 
 void update_platform_pointer_capture() {
+    if (!RECOMP_CONTROLS_POINTER_CAPTURE) {
+        // The guest draws the cursor: hide the OS one over its display, and
+        // leave the pointer free and absolute.
+        const bool hide = pointer_capture_wanted() && !g_close_requested;
+        if (hide != g_pointer_hidden) {
+            if (hide)
+                SDL_HideCursor();
+            else
+                SDL_ShowCursor();
+            g_pointer_hidden = hide;
+        }
+        return;
+    }
     const bool want = g_platform_capture_requested && pointer_capture_wanted() &&
                       !g_close_requested && !g_fullscreen_transition;
     if (want && !g_pointer_hidden) {
@@ -1588,8 +1605,29 @@ void web_frame() {
     host_d9_pump();
     host_present_pump();
     host_d9_frame(false);
-    if (g_web_guest_done.load())
+    if (g_web_guest_done.load()) {
+        // The game has ended. Silence the mixer - its last buffers would loop
+        // on - and say so over the last frame, which otherwise looks like a
+        // hang. A nonzero code from an unhandled exception is a crash.
+        host_audio_pause(true);
+        const uint32_t code = process_exited() ? process_exit_code() : 0xffffffffu;
+        MAIN_THREAD_EM_ASM(
+            {
+                var code = $0 >>> 0;
+                var box = document.createElement("div");
+                box.style.cssText = "position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);" +
+                                    "background:rgba(20,16,10,.92);color:#f0e0b0;padding:18px 26px;" +
+                                    "border:2px solid #b08a3a;border-radius:8px;font:16px sans-serif;" +
+                                    "z-index:1000;text-align:center;max-width:80%";
+                box.textContent = code == 0 ? "The game has exited."
+                                            : "The game stopped with error 0x" +
+                                                  code.toString(16).toUpperCase() +
+                                                  ". Reload the page to start again.";
+                document.body.appendChild(box);
+            },
+            code);
         emscripten_cancel_main_loop();
+    }
 }
 
 // The game's thread: the game's files are read from here, never from the

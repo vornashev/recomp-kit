@@ -1,4 +1,15 @@
 #include "imports.h"
+#include "../mods/mods_internal.h"
+#include "../mods/pop_mod_api.h"
+#include "../platform/os.h"
+// The tracer hooks through the mod loader when it is linked in.
+__attribute__((weak)) PopModStatus mods_hook_install(uint32_t owner, uint32_t addr, PopHookFn fn,
+                                                     int32_t mode, void *user, uint32_t *out_id);
+#include <string>
+#include <cstdlib>
+#include <chrono>
+#include <thread>
+#include <atomic>
 #include "gdi32_internal.h"
 #include "user32_internal.h"
 #include "kernel32_internal.h"
@@ -28,6 +39,8 @@ struct Tramp {
     uint32_t calls = 0;
     // Entered without a scheduling checkpoint (see atomic_import).
     bool atomic = false;
+    // An unimplemented import has been reported (once, however often called).
+    bool reported = false;
 };
 
 // Imports whose callers have just set up state the call reads back, with no
@@ -400,9 +413,93 @@ void imports_call_leaves_surfaces() {
     --g_import_calls;
 }
 
+// RECOMP_HEARTBEAT=<seconds>: a diagnostic thread that prints the last import
+// the guest called, how many it has made and the guest registers, so a run
+// that stops responding shows where it stopped. Reads are deliberately racy.
+namespace {
+std::atomic<uint32_t> g_hb_last{0};
+std::atomic<uint64_t> g_hb_calls{0};
+std::atomic<X86 *> g_hb_cpu{nullptr};
+void heartbeat_start() {
+    static std::atomic<bool> started{false};
+    const char *v = getenv("RECOMP_HEARTBEAT");
+    if (!v || started.exchange(true))
+        return;
+    int secs = atoi(v) > 0 ? atoi(v) : 5;
+    std::thread([secs] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(secs));
+            X86 *c = g_hb_cpu.load();
+            uint32_t t = g_hb_last.load();
+            const char *name = t ? imports_describe(t) : nullptr;
+            fprintf(stderr, "[heartbeat] calls=%llu last=%s eip=%08x esp=%08x ebp=%08x\n",
+                    (unsigned long long)g_hb_calls.load(), name ? name : "-", c ? c->eip : 0,
+                    c ? c->r[R_ESP] : 0, c ? c->r[R_EBP] : 0);
+            // The busiest imports over the interval (racy reads, diagnostics only).
+            static std::vector<uint64_t> last;
+            std::vector<std::pair<uint64_t, size_t>> rows;
+            size_t n = tramps().size();
+            last.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                uint64_t now = tramps()[i].calls;
+                if (now > last[i])
+                    rows.push_back({now - last[i], i});
+                last[i] = now;
+            }
+            std::sort(rows.rbegin(), rows.rend());
+            for (size_t i = 0; i < rows.size() && i < 18; ++i)
+                fprintf(stderr, "[heartbeat]   %8llu/%ds %s\n", (unsigned long long)rows[i].first,
+                        secs, tramps()[rows[i].second].desc.c_str());
+        }
+    }).detach();
+}
+} // namespace
+
+// RECOMP_TRACE_ADDRS=addr[,addr...]: print every call to these guest
+// functions with ECX, ESP and four stack arguments, and the EAX they return.
+// Diagnostic only, for comparing builds that should behave identically.
+namespace {
+void trace_before(const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *user) {
+    uint32_t a = (uint32_t)(uintptr_t)user, sp = cpu->esp;
+    fprintf(stderr, "[trace] -> %08x ecx=%08x esp=%08x args=%08x %08x %08x %08x\n", a, cpu->ecx, sp,
+            rd32(sp + 4), rd32(sp + 8), rd32(sp + 12), rd32(sp + 16));
+}
+void trace_after(const PopModApi *, pop_cpu_v1 *cpu, PopHookInvocation *, void *user) {
+    fprintf(stderr, "[trace] <- %08x eax=%08x\n", (uint32_t)(uintptr_t)user, cpu->eax);
+}
+void trace_install() {
+    static bool done = false;
+    const char *v = getenv("RECOMP_TRACE_ADDRS");
+    if (done || !v)
+        return;
+    done = true;
+    std::string list = v;
+    for (size_t at = 0; at < list.size();) {
+        size_t end = list.find(',', at);
+        std::string item = list.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        uint32_t addr = (uint32_t)strtoul(item.c_str(), nullptr, 16);
+        uint32_t id = 0;
+        // Weak: the runtime's own tests link without the mod loader.
+        if (addr && mods_hook_install) {
+            mods_hook_install(0, addr, trace_before, POP_HOOK_BEFORE, (void *)(uintptr_t)addr, &id);
+            mods_hook_install(0, addr, trace_after, POP_HOOK_AFTER, (void *)(uintptr_t)addr, &id);
+            fprintf(stderr, "[trace] watching %08x\n", addr);
+        }
+        if (end == std::string::npos)
+            break;
+        at = end + 1;
+    }
+}
+} // namespace
+
 bool imports_dispatch(X86 *c, uint32_t target) {
     if (!imports_is_trampoline(target))
         return false;
+    heartbeat_start();
+    trace_install();
+    g_hb_last.store(target, std::memory_order_relaxed);
+    g_hb_calls.fetch_add(1, std::memory_order_relaxed);
+    g_hb_cpu.store(c, std::memory_order_relaxed);
     // A bounded scheduling checkpoint. Cooperative threads must not depend on
     // the guest happening to call a blocking API: the frame limiter spins on
     // GetTickCount and would otherwise starve the service threads for as long
@@ -430,8 +527,16 @@ bool imports_dispatch(X86 *c, uint32_t target) {
     uint8_t argc = tramps()[idx].argc;
     // A guest exception can longjmp across fn(c). Keep no C++ owner live
     // across that call, and do not retain a pointer into the movable vector.
+    // The description is only for logs and observers; formatting it for every
+    // call cost more than many of the shims themselves.
     char desc[512];
-    snprintf(desc, sizeof desc, "%s", tramps()[idx].desc.c_str());
+    const bool first_report = !fn && !tramps()[idx].reported;
+    if (!fn)
+        tramps()[idx].reported = true;
+    if (log_level() >= 2 || g_call_observer || first_report || argc == ARGC_UNKNOWN)
+        snprintf(desc, sizeof desc, "%s", tramps()[idx].desc.c_str());
+    else
+        desc[0] = 0;
     ++tramps()[idx].calls;
     ++g_import_calls;
 
@@ -458,18 +563,65 @@ bool imports_dispatch(X86 *c, uint32_t target) {
         }
     }
 
+    // RECOMP_TRACE_IMPORTS=File,Directory: the calls whose name contains one of
+    // the comma-separated parts, with their first arguments (and the string an
+    // argument points at) and the result.
+    static const std::string trace_filter = [] {
+        const char *v = recomp_env("TRACE_IMPORTS");
+        return std::string(v ? v : "");
+    }();
+    bool traced = false;
+    uint32_t traced_args[4] = {};
+    char traced_name[128] = "";
+    if (!trace_filter.empty()) {
+        // Plain storage: a guest exception may longjmp across the shim.
+        snprintf(traced_name, sizeof traced_name, "%s", tramps()[idx].desc.c_str());
+        for (size_t at = 0; at <= trace_filter.size();) {
+            size_t end = trace_filter.find(',', at);
+            if (end == std::string::npos)
+                end = trace_filter.size();
+            if (end > at && strstr(traced_name, trace_filter.substr(at, end - at).c_str()))
+                traced = true;
+            at = end + 1;
+        }
+        if (traced)
+            for (int i = 0; i < 4; ++i)
+                traced_args[i] = rd32(c->r[R_ESP] + 4 + 4 * i);
+    }
+
     if (skip) {
         // The observer refused the call and has set the result itself.
     } else if (fn) {
         fn(c);
     } else {
-        log_once(desc, "unimplemented import %s: returning 0", desc);
+        if (first_report)
+            log_once(desc, "unimplemented import %s: returning 0", desc);
         set_eax(c, 0);
     }
     // Read after the shim ran, so the pointer is into the table as it is now.
-    if (g_return_observer)
-        g_return_observer(desc, c->r[R_EAX]);
+    if (g_return_observer && idx < tramps().size())
+        g_return_observer(tramps()[idx].desc.c_str(), c->r[R_EAX]);
     LOGV("<- %s (eax=%08x)", desc, c->r[R_EAX]);
+    if (traced) {
+        std::string line = std::string("[import] ") + traced_name + "(";
+        for (int i = 0; i < 4; ++i) {
+            char buf[48];
+            snprintf(buf, sizeof buf, "%s%08x", i ? ", " : "", traced_args[i]);
+            line += buf;
+            const uint32_t p = traced_args[i];
+            if (p >= 0x10000 && gm_valid(p, 1)) {
+                std::string str = gm_str(p, 160);
+                bool printable = str.size() >= 2;
+                for (unsigned char ch : str)
+                    printable = printable && (ch >= 0x20 && ch != 0x7f);
+                if (printable)
+                    line += " \"" + str + "\"";
+            }
+        }
+        char tail[64];
+        snprintf(tail, sizeof tail, ") = %08x err=%u", c->r[R_EAX], get_last_error());
+        fprintf(stderr, "%s%s\n", line.c_str(), tail);
+    }
 
     uint32_t pop = 4;
     if (argc == ARGC_CDECL) {

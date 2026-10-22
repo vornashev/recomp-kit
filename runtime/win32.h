@@ -106,6 +106,9 @@ enum Win32FileOp {
 };
 
 std::string win32_host_path_op(const std::string &guest_path, int op);
+// Paths and names between the game's ANSI code page ([game] ansi_codepage) and UTF-8.
+std::string win32_ansi_to_utf8(const std::string &s);
+std::string win32_utf8_to_ansi(const std::string &s);
 
 // A C++ throw as RaiseException sees it: the MSVC record (code 0xe06d7363)
 // carries the object and its throw info, which names the type; the object of

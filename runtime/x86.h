@@ -436,7 +436,7 @@ uint32_t recomp_callback_depth(void);
 void recomp_callback_truncate(uint32_t depth);
 void recomp_callback_reset(X86 *c);
 /* DIV/IDIV with a zero divisor or a quotient that does not fit. */
-void recomp_div_error(X86 *c, uint32_t addr);
+void recomp_div_error(X86 *c, uint32_t addr, int overflow);
 
 void recomp_rdtsc(X86 *c); /* -> EDX:EAX */
 void recomp_cpuid(X86 *c); /* EAX in -> EAX EBX ECX EDX */
@@ -786,12 +786,12 @@ static inline uint16_t imul2_16_f(X86 *c, uint16_t a, uint16_t b) {
 static inline void div8(X86 *c, uint8_t s, uint32_t at) {
     uint32_t n = (uint16_t)c->r[R_EAX], q;
     if (!s) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 0);
         return;
     }
     q = n / s;
     if (q > 0xffu) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     c->r[R_EAX] = (c->r[R_EAX] & 0xffff0000u) | (q & 0xffu) | ((n % s) << 8);
@@ -799,12 +799,12 @@ static inline void div8(X86 *c, uint8_t s, uint32_t at) {
 static inline void div16(X86 *c, uint16_t s, uint32_t at) {
     uint32_t n = ((uint32_t)(uint16_t)c->r[R_EDX] << 16) | (uint16_t)c->r[R_EAX], q;
     if (!s) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 0);
         return;
     }
     q = n / s;
     if (q > 0xffffu) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     c->r[R_EAX] = (c->r[R_EAX] & 0xffff0000u) | q;
@@ -813,12 +813,12 @@ static inline void div16(X86 *c, uint16_t s, uint32_t at) {
 static inline void div32(X86 *c, uint32_t s, uint32_t at) {
     uint64_t n = ((uint64_t)c->r[R_EDX] << 32) | c->r[R_EAX], q;
     if (!s) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 0);
         return;
     }
     q = n / s;
     if (q > 0xffffffffu) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     c->r[R_EAX] = (uint32_t)q;
@@ -828,16 +828,16 @@ static inline void div32(X86 *c, uint32_t s, uint32_t at) {
 static inline void idiv8(X86 *c, uint8_t s, uint32_t at) {
     int32_t n = (int16_t)c->r[R_EAX], q;
     if (!s) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 0);
         return;
     }
     if ((int8_t)s == -1 && n == INT32_MIN) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     q = n / (int8_t)s;
     if (q != (int8_t)q) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     c->r[R_EAX] = (c->r[R_EAX] & 0xffff0000u) | ((uint32_t)q & 0xffu) |
@@ -846,16 +846,16 @@ static inline void idiv8(X86 *c, uint8_t s, uint32_t at) {
 static inline void idiv16(X86 *c, uint16_t s, uint32_t at) {
     int32_t n = (int32_t)(((uint32_t)(uint16_t)c->r[R_EDX] << 16) | (uint16_t)c->r[R_EAX]), q;
     if (!s) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 0);
         return;
     }
     if ((int16_t)s == -1 && n == INT32_MIN) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     q = n / (int16_t)s;
     if (q != (int16_t)q) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     c->r[R_EAX] = (c->r[R_EAX] & 0xffff0000u) | ((uint32_t)q & 0xffffu);
@@ -864,16 +864,16 @@ static inline void idiv16(X86 *c, uint16_t s, uint32_t at) {
 static inline void idiv32(X86 *c, uint32_t s, uint32_t at) {
     int64_t n = (int64_t)(((uint64_t)c->r[R_EDX] << 32) | c->r[R_EAX]), q;
     if (!s) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 0);
         return;
     }
     if ((int32_t)s == -1 && n == INT64_MIN) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     q = n / (int32_t)s;
     if (q != (int32_t)q) {
-        recomp_div_error(c, at);
+        recomp_div_error(c, at, 1);
         return;
     }
     c->r[R_EAX] = (uint32_t)q;

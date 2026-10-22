@@ -64,6 +64,9 @@ bool blit(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src
     int dw, dh, srcw, srch;
     if (!dc_size(dst, &dw, &dh) || !dc_size(src, &srcw, &srch) || !w || !h || !sw || !sh)
         return false;
+    if (rop == 0x00cc0020u && !mask && w > 0 && h > 0 && sw == w && sh == h &&
+        !dc_is_monochrome(dst) && !dc_is_monochrome(src) && copy_dib_rect(dst, x, y, w, h, src, sx, sy))
+        return true; // SRCCOPY
     int64_t width = std::abs(int64_t(w)), height = std::abs(int64_t(h));
     Rect clip = clip_box(dst);
     int64_t left = std::max<int64_t>(clip.l, w < 0 ? int64_t(x) - width : x),

@@ -85,7 +85,8 @@ if(WIN32 AND CMAKE_HOST_WIN32 AND NOT RECOMP_VIDEO_DEFAULT)
 endif()
 
 if(RECOMP_VIDEO)
-  if(NOT APPLE AND NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
+  if(NOT APPLE AND NOT ANDROID AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32
+      AND NOT EMSCRIPTEN)
     message(FATAL_ERROR "RECOMP_VIDEO is not supported on ${CMAKE_SYSTEM_NAME}")
   endif()
   include(ExternalProject)
@@ -112,7 +113,20 @@ if(RECOMP_VIDEO)
     --disable-autodetect --disable-xlib --disable-libxcb --disable-sdl2
     --disable-iconv --disable-zlib --disable-bzlib --disable-lzma
     --disable-securetransport --disable-audiotoolbox --disable-videotoolbox)
-  if(IOS)
+  if(EMSCRIPTEN)
+    # Static archives linked into the one wasm module. The objects need the
+    # page's -pthread (shared memory), but FFmpeg's own threads stay off: a
+    # decoder that spawned workers would need a pool sized at link time.
+    list(REMOVE_ITEM RECOMP_FFMPEG_CONFIGURE --enable-shared --disable-static --enable-pic)
+    list(APPEND RECOMP_FFMPEG_CONFIGURE
+      --enable-static --disable-shared
+      --enable-cross-compile --target-os=none --arch=x86_32
+      --disable-asm --disable-inline-asm --disable-x86asm --disable-stripping
+      --disable-runtime-cpudetect --disable-pthreads --disable-w32threads --disable-os2threads
+      --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER} --dep-cc=${CMAKE_C_COMPILER}
+      --ar=${CMAKE_AR} --ranlib=${CMAKE_RANLIB} --nm=${CMAKE_NM}
+      "--extra-cflags=-pthread -O3" "--extra-ldflags=-pthread")
+  elseif(IOS)
     # CMake accepts either an SDK name or an absolute sysroot; FFmpeg needs
     # the directory. This dependency targets arm64 devices, not the simulator.
     set(RECOMP_FFMPEG_SYSROOT "${CMAKE_OSX_SYSROOT}")
@@ -181,7 +195,10 @@ if(RECOMP_VIDEO)
       set(major 61)
     endif()
     set(libdir lib)
-    if(ANDROID)
+    if(EMSCRIPTEN)
+      set(filename lib${component}.a)
+      set(soname ${filename})
+    elseif(ANDROID)
       # FFmpeg's Android target installs unversioned names and SONAMEs.
       set(filename lib${component}.so)
       set(soname ${filename})
@@ -197,11 +214,18 @@ if(RECOMP_VIDEO)
       set(soname ${filename})
     endif()
     list(APPEND RECOMP_FFMPEG_LIBRARIES "${RECOMP_FFMPEG_PREFIX}/${libdir}/${filename}")
-    add_library(ffmpeg::${component} SHARED IMPORTED GLOBAL)
-    set_target_properties(ffmpeg::${component} PROPERTIES
-      IMPORTED_LOCATION "${RECOMP_FFMPEG_PREFIX}/${libdir}/${filename}"
-      IMPORTED_SONAME "${soname}"
-      INTERFACE_INCLUDE_DIRECTORIES "${RECOMP_FFMPEG_PREFIX}/include")
+    if(EMSCRIPTEN)
+      add_library(ffmpeg::${component} STATIC IMPORTED GLOBAL)
+      set_target_properties(ffmpeg::${component} PROPERTIES
+        IMPORTED_LOCATION "${RECOMP_FFMPEG_PREFIX}/${libdir}/${filename}"
+        INTERFACE_INCLUDE_DIRECTORIES "${RECOMP_FFMPEG_PREFIX}/include")
+    else()
+      add_library(ffmpeg::${component} SHARED IMPORTED GLOBAL)
+      set_target_properties(ffmpeg::${component} PROPERTIES
+        IMPORTED_LOCATION "${RECOMP_FFMPEG_PREFIX}/${libdir}/${filename}"
+        IMPORTED_SONAME "${soname}"
+        INTERFACE_INCLUDE_DIRECTORIES "${RECOMP_FFMPEG_PREFIX}/include")
+    endif()
     if(WIN32)
       if(RECOMP_FFMPEG_MSVC)
         # FFmpeg's win64 target installs the import library beside the DLL.

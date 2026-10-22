@@ -4,6 +4,7 @@
 #include "memory.h"
 #include "win32.h"
 #include "gdi_image.h"
+#include "../platform/os.h"
 #include <algorithm>
 #include <set>
 #include <vector>
@@ -700,6 +701,32 @@ void message_wait(X86 *c, bool ex) {
     if (signalled(&result)) {
         set_eax(c, result);
         return;
+    }
+    // Then wait out the timeout, as the real call does. Heroes IV's idle loop
+    // asks its scheduler how long until the next thing is due and waits that
+    // long here; a wait that came straight back turned it into a spin of
+    // ~100k PeekMessage/timeGetTime calls a second, which in the browser cost
+    // more than drawing the map. Without a host nothing could post a message,
+    // so there it still returns at once.
+    const uint32_t timeout = ex ? arg(c, 2) : arg(c, 3);
+    if (timeout && g_message_waiter) {
+        const uint64_t start = os_monotonic_ns();
+        for (;;) {
+            pump_mouse_input(c);
+            if (!queue().empty() || paint_pending()) {
+                set_eax(c, n);
+                return;
+            }
+            if (timeout != 0xffffffffu &&
+                (os_monotonic_ns() - start) / 1000000u >= (uint64_t)timeout)
+                break;
+            guest_sleep_ms(1);
+            pump_once(c);
+            if (signalled(&result)) {
+                set_eax(c, result);
+                return;
+            }
+        }
     }
     set_eax(c, 0x102);
 }

@@ -88,6 +88,9 @@ def load_controls(controls, touch, source):
     if controls["default_layout"] not in CONTROLS_LAYOUTS:
         raise ValueError("%s: [controls] default_layout must be one of %s, not %r"
                          % (source, ", ".join(CONTROLS_LAYOUTS), controls["default_layout"]))
+    capture = controls.setdefault("pointer_capture", True)
+    if not isinstance(capture, bool):
+        raise ValueError("%s: [controls] pointer_capture must be a boolean, not %r" % (source, capture))
     pad = controls.setdefault("pad", "mapped")
     if pad not in ("native", "mapped", "off"):
         raise ValueError('%s: [controls] pad must be "native", "mapped" or "off", not %r' % (source, pad))
@@ -152,6 +155,11 @@ def load(game_dir):
         raise ValueError("%s: missing [game] keys: %s" % (source, ", ".join(missing)))
     game["heap_base"] = validate_heap_base(int(game.get("heap_base", HEAP_BASE_DEFAULT)))
     windows_version(game.setdefault("windows_version", "4.10"))
+    # The ANSI code page a localized release expects (GetACP, and the encoding
+    # of every path the -A file APIs pass). 1252 keeps paths byte-for-byte.
+    codepage = game.setdefault("ansi_codepage", 1252)
+    if codepage not in (1251, 1252):
+        raise ValueError("%s: [game] ansi_codepage must be 1251 or 1252, not %r" % (source, codepage))
     translate = cfg.setdefault("translate", {})
     resumable = translate.setdefault("resumable_stacks", False)
     if not isinstance(resumable, bool):

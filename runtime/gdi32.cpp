@@ -982,6 +982,7 @@ bool pixel(uint32_t hdc, int64_t x, int64_t y, uint32_t *p, bool write, bool ble
                 ((((*p >> c) & 255) * alpha + ((value >> c) & 255) * (255 - alpha) + 127) / 255)
                 << c;
     }
+    dc->note_written(x, y, x + 1, y + 1);
     if (!d) {
         s->argb[size_t(y) * s->w + x] = result | 0xff000000;
         s->dirty = true;
@@ -1052,6 +1053,60 @@ bool mask_bit(uint32_t bitmap, int64_t x, int64_t y, bool *set) {
     *set = ((rd8(at) >> (7 - x % 8)) & 1) != 0;
     return true;
 }
+// SRCCOPY between two DIBs of one pixel format, without stretching, mirroring
+// or clip regions: rows are moved as bytes. Games that compose into their own
+// DIB section and BitBlt it to a DirectDraw surface's DC do this hundreds of
+// times a second, where the per-pixel path below dominated the frame.
+// Returns false, touching nothing, whenever the general path is needed.
+bool copy_dib_rect(uint32_t dst, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t src,
+                   int32_t sx, int32_t sy) {
+    auto *dd = dc_of(dst), *sd = dc_of(src);
+    if (!dd || !sd || dd->clipped || sd->clipped || w <= 0 || h <= 0)
+        return false;
+    if ((dd->window && dd->window != dd->surface) || (sd->window && sd->window != sd->surface))
+        return false;
+    Dib *D = dib_in_dc(dst), *S = dib_in_dc(src);
+    if (!D || !S || D->bpp != S->bpp || (D->bpp != 16 && D->bpp != 24 && D->bpp != 32))
+        return false;
+    if (D->bpp == 16 || D->compression == 3 || S->compression == 3) {
+        uint32_t dm[3] = {D->masks[0] ? D->masks[0] : 0x7c00u, D->masks[1] ? D->masks[1] : 0x03e0u,
+                          D->masks[2] ? D->masks[2] : 0x001fu};
+        uint32_t sm[3] = {S->masks[0] ? S->masks[0] : 0x7c00u, S->masks[1] ? S->masks[1] : 0x03e0u,
+                          S->masks[2] ? S->masks[2] : 0x001fu};
+        if (memcmp(dm, sm, sizeof dm) != 0)
+            return false;
+    }
+    // Logical to device coordinates, as pixel() maps them.
+    int64_t dx = x, dy = y, ssx = sx, ssy = sy;
+    offset(*dd, &dx, &dy);
+    offset(*sd, &ssx, &ssy);
+    const int64_t dw = D->width, dh = std::abs(int64_t(D->height));
+    const int64_t swd = S->width, shd = std::abs(int64_t(S->height));
+    int64_t cw = w, ch = h;
+    // Clip against both bitmaps, moving the source with the destination.
+    if (dx < 0) { ssx -= dx; cw += dx; dx = 0; }
+    if (dy < 0) { ssy -= dy; ch += dy; dy = 0; }
+    if (ssx < 0) { dx -= ssx; cw += ssx; ssx = 0; }
+    if (ssy < 0) { dy -= ssy; ch += ssy; ssy = 0; }
+    cw = std::min({cw, dw - dx, swd - ssx});
+    ch = std::min({ch, dh - dy, shd - ssy});
+    if (cw <= 0 || ch <= 0)
+        return true;
+    const uint32_t bytes = uint32_t(cw * D->bpp / 8);
+    for (int64_t row = 0; row < ch; ++row) {
+        int64_t drow = dy + row, srow = ssy + row;
+        uint32_t da = D->bits + uint32_t(D->height > 0 ? dh - 1 - drow : drow) * D->stride +
+                      uint32_t(dx * D->bpp / 8);
+        uint32_t sa = S->bits + uint32_t(S->height > 0 ? shd - 1 - srow : srow) * S->stride +
+                      uint32_t(ssx * S->bpp / 8);
+        if (!gm_valid(da, bytes) || !gm_valid(sa, bytes))
+            return row == 0 ? false : true;
+        memmove(g_mem + da, g_mem + sa, bytes);
+    }
+    dd->note_written(dx, dy, dx + cw, dy + ch);
+    return true;
+}
+
 bool read_pixel(uint32_t dc, int64_t x, int64_t y, uint32_t *p, bool preserve_alpha) {
     return pixel(dc, x, y, p, false, false, preserve_alpha);
 }
@@ -1963,6 +2018,14 @@ void gdi_bind_surface_dc(uint32_t dc, int w, int h, int bpp, uint32_t pitch, uin
     uint32_t bitmap = g_next_bitmap++;
     dibs()[bitmap] = std::move(d);
     dcs()[dc].bitmap = bitmap;
+}
+bool gdi_written_rows(uint32_t dc, int32_t *first, int32_t *last) {
+    auto *d = dc_of(dc);
+    if (!d || d->written[1] >= d->written[3])
+        return false;
+    *first = int32_t(std::max<int64_t>(d->written[1], 0));
+    *last = int32_t(std::min<int64_t>(d->written[3] - 1, INT32_MAX));
+    return true;
 }
 void gdi_unbind_surface_dc(uint32_t dc) {
     auto *d = dc_of(dc);

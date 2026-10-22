@@ -1,5 +1,8 @@
 // os_posix.cpp - the platform layer on macOS and Linux. The only file above
 // third_party/ that may include a POSIX or Mach header besides os_win32.cpp.
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 #include "os.h"
 
 #include <dirent.h>
@@ -356,6 +359,12 @@ uint64_t os_monotonic_ns(void) {
     // (gettimeofday); the uptime clock is a plain mach_absolute_time read.
     // Every import call reads this clock, so the difference is large.
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#endif
+#ifdef __EMSCRIPTEN__
+    // clock_gettime goes through WASI with 64-bit BigInt conversions on both
+    // sides; performance.now() as a double is the same clock without them.
+    // Every import reads this, so it showed as a fifth of a guest frame.
+    return (uint64_t)(emscripten_get_now() * 1e6);
 #endif
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

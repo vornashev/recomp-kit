@@ -760,8 +760,14 @@ void move_pointer(int32_t x, int32_t y) {
 bool press_button(int button, bool down) {
     if (button < 0 || button > 2)
         return false;
-    if (host_gate_button(button, down, g_pointer_x, g_pointer_y))
+    if (host_gate_button(button, down, g_pointer_x, g_pointer_y)) {
+        if (recomp_env("SMOKE_DEBUG_HOLD"))
+            fprintf(stderr, "[smoke] button %d %s consumed by the gate\n", button, down ? "down" : "up");
         return false;
+    }
+    if (recomp_env("SMOKE_DEBUG_HOLD"))
+        fprintf(stderr, "[smoke] button %d %s posted at (%d,%d)\n", button, down ? "down" : "up",
+                g_pointer_x, g_pointer_y);
     if (g_window_gestures) {
         if (down)
             host_gate_begin_drag(&g_window_hit);
@@ -804,6 +810,8 @@ uint32_t g_release_at_presents = 0;
 // faster than 50 ms a frame and four frames there can be under ten
 // milliseconds, which is shorter than the 120 the click was written to hold.
 uint32_t g_press_at_ms = 0;
+// And the host's own clock at the press, for a guest that presents nothing.
+uint64_t g_press_at_wall_ns = 0;
 
 HostScriptTouch g_touch;
 int g_touch_drawable_w = 640, g_touch_drawable_h = 480;
@@ -1392,6 +1400,7 @@ void run_step(const HostScriptStep &step) {
         g_release_at_presents =
             g_presents + host_script_input_hold_frames(kClickHoldMs, host_pinned_clock_step());
         g_press_at_ms = boot_guest_millis();
+        g_press_at_wall_ns = os_monotonic_ns();
         break;
     case HOST_SCRIPT_TAP:
     case HOST_SCRIPT_TAP_DRAWABLE:
@@ -1698,8 +1707,21 @@ void tick() {
     // loop's rule exists to prevent, arriving by the one route that bypasses
     // it. impl-t7 named this as the path their fix did not cover; it is closed
     // here rather than left for the next twelve-run measurement to find.
-    if (g_holding_button >= 0 && g_presents >= g_release_at_presents &&
-        boot_guest_millis() - g_press_at_ms >= kClickHoldMs) {
+    // A game whose screen is static until something changes (Heroes IV's
+    // menus) presents nothing while the button is down, and the pinned clock
+    // barely moves with no frames, so neither the frame count nor guest time
+    // would ever release it; past four hold times of real time, release.
+    uint64_t held_wall_ms = (os_monotonic_ns() - g_press_at_wall_ns) / 1000000u;
+    if (g_holding_button >= 0 && recomp_env("SMOKE_DEBUG_HOLD")) {
+        static uint32_t n = 0;
+        if (++n % 200 == 1)
+            fprintf(stderr, "[smoke] holding %d for %llu ms, presents %u/%u\n", g_holding_button,
+                    (unsigned long long)held_wall_ms, g_presents, g_release_at_presents);
+    }
+    if (g_holding_button >= 0 &&
+        ((g_presents >= g_release_at_presents &&
+          boot_guest_millis() - g_press_at_ms >= kClickHoldMs) ||
+         held_wall_ms >= 4u * kClickHoldMs)) {
         press_button((int)g_holding_button, false);
         g_holding_button = -1;
         return;

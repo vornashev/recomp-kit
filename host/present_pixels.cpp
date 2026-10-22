@@ -6,6 +6,7 @@
 // smoke host expands the same pixels to write them to disk and to measure them.
 // Linking MetalKit to do that would pull a view class into a run that must not
 // create one.
+#include <cstring>
 #include "present.h"
 #include "../dx/host_api.h"
 #include "../runtime/profile.h"
@@ -111,16 +112,27 @@ extern "C" void host_present_expand_rgb565(const uint8_t *src, int w, int h, int
                                            uint8_t *out) {
     if (!src || !out || w <= 0 || h <= 0)
         return;
+    // Every 16-bit value expanded once: a frame is then one table load and one
+    // 32-bit store per pixel, where the per-channel scaling was most of the
+    // presenter's time on the web.
+    static const uint32_t *table = [] {
+        auto *t = new uint32_t[65536];
+        for (uint32_t p = 0; p < 65536; ++p) {
+            // Scaled, not shifted: 31 has to become 255 or white is not white.
+            uint32_t r = ((p >> 11) & 0x1f) * 255 / 31, g = ((p >> 5) & 0x3f) * 255 / 63,
+                     b = (p & 0x1f) * 255 / 31;
+            uint8_t bytes[4] = {(uint8_t)r, (uint8_t)g, (uint8_t)b, 255};
+            memcpy(&t[p], bytes, 4);
+        }
+        return t;
+    }();
     for (int y = 0; y < h; ++y) {
         const uint8_t *row = src + (size_t)y * (size_t)pitch;
         uint8_t *o = out + (size_t)y * (size_t)w * 4;
         for (int x = 0; x < w; ++x) {
-            uint32_t p = (uint32_t)(row[2 * x] | (row[2 * x + 1] << 8));
-            // Scaled, not shifted: 31 has to become 255 or white is not white.
-            o[4 * x + 0] = (uint8_t)(((p >> 11) & 0x1f) * 255 / 31);
-            o[4 * x + 1] = (uint8_t)(((p >> 5) & 0x3f) * 255 / 63);
-            o[4 * x + 2] = (uint8_t)((p & 0x1f) * 255 / 31);
-            o[4 * x + 3] = 255;
+            uint16_t p;
+            memcpy(&p, row + 2 * x, 2);
+            memcpy(o + 4 * x, &table[p], 4);
         }
     }
 }

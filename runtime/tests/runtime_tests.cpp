@@ -6007,6 +6007,26 @@ static void test_user32_window_model() {
         call_import(&c, "KERNEL32.dll", "CloseHandle", {idle});
         call_import(&c, "KERNEL32.dll", "CloseHandle", {fired});
     }
+    // A timed wait is a wait: it returns when a message arrives, or once the
+    // timeout has passed, and not before. Heroes IV's idle loop spun otherwise.
+    {
+        while (call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0, 0, 1}))
+            ;
+        host_set_message_waiter(vcl_wait_posts_late);
+        vcl_late_hwnd = hwnd;
+        vcl_wait_calls = 0;
+        check(call_import(&c, "USER32.dll", "MsgWaitForMultipleObjects", {0, 0, 0, 5000, 0xff}) ==
+                      0 &&
+                  vcl_wait_calls == 3,
+              "a timed wait returns once a message is queued");
+        call_import(&c, "USER32.dll", "PeekMessageW", {msg, 0, 0, 0, 1});
+        host_set_message_waiter(vcl_wait_once);
+        const uint64_t t0 = os_monotonic_ns();
+        check(call_import(&c, "USER32.dll", "MsgWaitForMultipleObjects", {0, 0, 0, 20, 0xff}) ==
+                      0x102 &&
+                  os_monotonic_ns() - t0 >= 20000000u,
+              "and otherwise times out after the timeout, not before");
+    }
     host_set_message_waiter(nullptr);
     host_set_key_state(65, true);
     check(call_import(&c, "USER32.dll", "GetKeyboardState", {s + 0x600}) == 1 &&

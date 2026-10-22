@@ -6,7 +6,9 @@
 #include "profile.h"
 // kernel32.cpp: a guest exception unwinding past an atomic stretch ends it.
 void sched_atomic_unwind_to_esp(uint32_t esp);
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <map>
 #include <vector>
@@ -168,6 +170,29 @@ void finish_dispatch(SehDispatch *d) {
     release_dispatch(d);
 }
 
+// Windows calls every handler through RtlpExecuteHandler, which first puts a
+// registration of its own at the head of the chain: {next, its handler, the
+// frame being dispatched}. Code inside a handler sees that record in FS:[0];
+// MSVC's _UnwindNestedFrames saves it, unwinds below it and links it back on
+// top. Without it the saved head is the frame itself, which the re-link turns
+// into a registration whose next is itself.
+void dispatcher_continue(X86 *c) {
+    set_eax(c, 1); // ExceptionContinueSearch, should anything call it
+}
+uint32_t dispatcher_handler() {
+    static uint32_t addr = 0;
+    if (!addr) {
+        static const ImportShim shim[] = {
+            {"KERNEL32.dll", "RecompSehDispatcher", 4, dispatcher_continue}};
+        imports_register(shim, 1);
+        addr = imports_resolve("KERNEL32.dll", "RecompSehDispatcher");
+    }
+    return addr;
+}
+bool is_dispatcher_record(uint32_t reg) {
+    return reg != END_CHAIN && gm_valid(reg, 12) && rd32(reg + 4) == dispatcher_handler();
+}
+
 uint32_t call_handler(X86 *c, uint32_t reg, SehDispatch *d) {
     uint32_t handler = rd32(reg + 4);
     if (!handler || !gm_valid(handler, 1))
@@ -175,7 +200,20 @@ uint32_t call_handler(X86 *c, uint32_t reg, SehDispatch *d) {
     LOGV("SEH handler: registration=%08x handler=%08x flags=%08x", reg, handler,
          rd32(d->record + 4));
     uint32_t args[] = {d->record, reg, d->context, 0};
+    uint32_t saved_esp = c->r[R_ESP];
+    uint32_t rec = (saved_esp - 12) & ~3u;
+    wr32(rec, chain_head(c));
+    wr32(rec + 4, dispatcher_handler());
+    wr32(rec + 8, reg);
+    c->r[R_ESP] = rec;
+    wr32(c->fs_base, rec);
     uint32_t disposition = guest_call(c, handler, args, 4);
+    // RtlpExecuteHandler pops its record back off whatever the handler did.
+    wr32(c->fs_base, rd32(rec));
+    c->r[R_ESP] = saved_esp;
+    if (getenv("RECOMP_SEH_TRACE"))
+        fprintf(stderr, "[seh] handler %08x for registration %08x (state %08x) code %08x flags %x -> %u\n",
+                handler, reg, rd32(reg + 8), rd32(d->record), rd32(d->record + 4), disposition);
     if (disposition == 0) {
         LOGW("ExceptionContinueExecution requested; not supported (record=%08x code=%08x "
              "registration=%08x handler=%08x)",
@@ -188,6 +226,26 @@ uint32_t call_handler(X86 *c, uint32_t reg, SehDispatch *d) {
         fatal_abort();
     }
     return disposition;
+}
+// The saved-ESP slot of an MSVC registration, or 0 for any other frame.
+// A C++ frame's handler is the compiler's stub MOV EAX,FuncInfo / JMP
+// __CxxFrameHandler (B8 imm32 E9 rel32), and its function keeps ESP at
+// [reg-4]. A __try frame (_except_handler3) has the scope table and trylevel
+// after the handler and ESP at [reg-8]; its handler begins with the CRT's
+// PUSH EBP / MOV EBP,ESP / SUB ESP,8 / PUSH EBX / PUSH ESI / PUSH EDI.
+uint32_t msvc_frame_saved_esp(uint32_t reg) {
+    if (!reg || reg < 8 || !gm_valid(reg - 8, 16))
+        return 0;
+    uint32_t handler = rd32(reg + 4);
+    if (!handler || !gm_valid(handler, 11))
+        return 0;
+    const uint8_t *h = gm_ptr(handler);
+    if (h[0] == 0xB8 && h[5] == 0xE9)
+        return rd32(reg - 4);
+    static const uint8_t seh3[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x53, 0x56, 0x57};
+    if (memcmp(h, seh3, sizeof seh3) == 0)
+        return rd32(reg - 8);
+    return 0;
 }
 } // namespace
 
@@ -244,6 +302,16 @@ jmp_buf *recomp_seh_frame_enter(X86 *c) {
     recomp_seh_validate_chain(c, "enter", "");
     uint32_t reg = chain_head(c);
     validate_registration(c, reg, 0);
+    // A record at or below this one is from a frame that left without a
+    // recognized restore (an exception, a tail jump): its stack is reused.
+    while (!state.frames.empty()) {
+        SehFrame *old = state.frames.back();
+        if (old->cpu != c || old->active_landing || old->registration > reg ||
+            old->callback_depth != recomp_callback_depth())
+            break;
+        state.frames.pop_back();
+        delete old;
+    }
     SehFrame *f = new SehFrame{};
     f->cpu = c;
     // Some helpers fill caller-reserved words above their own saved registers.
@@ -291,26 +359,36 @@ jmp_buf *recomp_seh_frame_adopt(X86 *c) {
     return nullptr;
 }
 
+// Retire the checkpoints a restore of FS:[0] unlinked. Frames sit in stack
+// order - each newer one deeper (lower) than the last - so walk from the
+// newest and stop at the first that is still live: the published chain head
+// and every older registration remain. Delphi restores with POP FS:[EAX],
+// after which ESP is above the record; MSVC restores with MOV FS:[0],reg
+// while ESP is still below it, so a registration below the new head is dead
+// too. Stopping early keeps a deep MSVC call tree linear.
 void recomp_seh_frame_leave(X86 *c) {
     recomp_seh_validate_chain(c, "leave", "");
+    uint32_t head = chain_head(c), esp = c->r[R_ESP];
     bool removed = false;
     for (size_t i = state.frames.size(); i-- > 0;) {
         SehFrame *f = state.frames[i];
-        if (f->cpu == c && f->registration < c->r[R_ESP] &&
-            (f->callback_depth == recomp_callback_depth() || f->active_landing)) {
-            LOGV("SEH leave: registration=%08x established=%08x EIP=%08x ESP=%08x", f->registration,
-                 f->establishing_eip, c->eip, c->r[R_ESP]);
-            if (f->active_landing)
-                f->retired = true; // intercept still needs this stable environment
-            else {
-                state.frames.erase(state.frames.begin() + i);
-                delete f;
-            }
-            removed = true;
+        if (f->cpu != c || !(f->callback_depth == recomp_callback_depth() || f->active_landing))
+            continue;
+        bool dead = head == END_CHAIN || f->registration < head || f->registration < esp;
+        if (!dead)
+            break;
+        LOGV("SEH leave: registration=%08x established=%08x EIP=%08x ESP=%08x", f->registration,
+             f->establishing_eip, c->eip, esp);
+        if (f->active_landing)
+            f->retired = true; // intercept still needs this stable environment
+        else {
+            state.frames.erase(state.frames.begin() + i);
+            delete f;
         }
+        removed = true;
     }
     if (!removed)
-        LOGV("SEH leave: no retired frame at ESP=%08x", c->r[R_ESP]);
+        LOGV("SEH leave: no retired frame at ESP=%08x", esp);
 }
 
 uint32_t recomp_seh_pending_target(void) {
@@ -320,15 +398,32 @@ uint32_t recomp_seh_pending_target(void) {
 // Called only for computed jumps, before even an existing dispatch-table hit.
 // The dispatcher keeps its own ESP; the pending registration identifies env.
 void recomp_seh_intercept(X86 *c, uint32_t target) {
+    // An import thunk (JMP [IAT]) is a computed jump too, but it never lands
+    // on a handler block: MSVC's CRT reaches RtlUnwind itself through one
+    // while a catch is being prepared. Let the call proceed to its shim.
+    if (imports_is_trampoline(target))
+        return;
+    uint32_t reg = state.g_seh_pending_target;
+    // MSVC frames land differently from Delphi's: after RtlUnwind the CRT
+    // still runs destructors and the catch funclet on the dispatcher's stack,
+    // and those contain computed jumps of their own (switch tables, vtable
+    // thunks). The landing is the one jump that restores the frame's saved
+    // ESP first - _JumpToContinuation's MOV ESP,[reg-4] for a C++ frame,
+    // _except_handler3's [reg-8] for a __try frame. Any other computed jump
+    // while an MSVC unwind is pending is ordinary code.
+    if (uint32_t saved = msvc_frame_saved_esp(reg); saved && c->r[R_ESP] != saved)
+        return;
     recomp_seh_validate_chain(c, "intercept", "");
     trace_frames(c, "intercept");
-    uint32_t reg = state.g_seh_pending_target;
     SehFrame *landing = nullptr;
     for (size_t i = state.frames.size(); i-- > 0;)
         if (state.frames[i]->cpu == c && state.frames[i]->registration == reg) {
             landing = state.frames[i];
             break;
         }
+    if (getenv("RECOMP_SEH_TRACE"))
+        fprintf(stderr, "[seh] landing on %08x at %08x ESP=%08x EBP=%08x (checkpoint %s)\n", reg,
+                target, c->r[R_ESP], c->r[R_EBP], landing ? "live" : "missing");
     if (!landing || landing->orphan || state.pending_cpu != c)
         invalid_chain(c, reg, target, "unwind target has no live checkpoint");
     state.g_seh_pending_target = 0;
@@ -362,6 +457,8 @@ void recomp_seh_intercept(X86 *c, uint32_t target) {
 
 void recomp_seh_land(X86 *c) {
     trace_frames(c, "landing");
+    if (getenv("RECOMP_SEH_TRACE"))
+        fprintf(stderr, "[seh] landed: EIP=%08x ESP=%08x EBP=%08x\n", c->eip, c->r[R_ESP], c->r[R_EBP]);
     SehFrame *landing = state.landing;
     if (!landing || landing->cpu != c || !landing->finished)
         invalid_chain(c, 0, c->eip, "landing without a checkpoint");
@@ -440,9 +537,23 @@ int recomp_seh_raise(X86 *c, uint32_t code, uint32_t flags, uint32_t nargs, uint
     for (uint32_t i = 0; i < nargs; ++i)
         wr32(d->record + 20 + i * 4, rd32(args + i * 4));
     ChainWalk walk;
+    uint32_t nested_frame = 0;
     for (uint32_t reg = chain_head(c); reg != END_CHAIN;) {
         walk.visit(c, reg, 0);
         uint32_t next = rd32(reg);
+        if (reg == nested_frame) {
+            wr32(d->record + 4, rd32(d->record + 4) & ~0x10u);
+            nested_frame = 0;
+        }
+        if (is_dispatcher_record(reg)) {
+            // A raise from inside a handler: Windows' dispatcher record answers
+            // ExceptionNestedException, and frames up to the one whose handler
+            // was running see EXCEPTION_NESTED_CALL.
+            wr32(d->record + 4, rd32(d->record + 4) | 0x10u);
+            nested_frame = std::max(nested_frame, rd32(reg + 8));
+            reg = next;
+            continue;
+        }
         call_handler(c, reg, d);
         reg = next;
     }
@@ -482,7 +593,8 @@ void recomp_seh_unwind(X86 *c, uint32_t target, uint32_t target_ip, uint32_t rec
             invalid_chain(c, reg, target, "unwind target is absent from chain");
         walk.visit(c, reg, target);
         uint32_t next = rd32(reg);
-        call_handler(c, reg, d);
+        if (!is_dispatcher_record(reg)) // a dispatcher's own record just comes off
+            call_handler(c, reg, d);
         wr32(c->fs_base, next);
         reg = next;
     }
@@ -493,6 +605,8 @@ void recomp_seh_unwind(X86 *c, uint32_t target, uint32_t target_ip, uint32_t rec
     state.pending_cpu = target ? c : nullptr;
     c->r[R_EAX] = retval;
     LOGV("RtlUnwind: registration=%08x target_ip=%08x retval=%08x", target, target_ip, retval);
+    if (getenv("RECOMP_SEH_TRACE"))
+        fprintf(stderr, "[seh] RtlUnwind to %08x, return to %08x\n", target, target_ip);
     trace_frames(c, "unwind ready");
     finish_dispatch(d);
 }

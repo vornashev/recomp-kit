@@ -1,5 +1,6 @@
 // Asset overlay: profile, reverse mod load order, then the original game.
-// Mutations never fall through; deleting a shadow reveals the lower file.
+// Mutations never fall through; deleting a shadow reveals the lower file, and
+// deleting a file only a lower tier has leaves a whiteout in the profile.
 #include "mods_internal.h"
 #include "../runtime/layout.h"
 #include "../runtime/mods_seam.h"
@@ -187,6 +188,66 @@ bool copy_up(const std::string &from, const std::string &to) {
         os_unlink(temp.c_str());
     return ok;
 }
+// Whiteouts. Deleting or renaming away a file that only a lower tier has
+// cannot touch that tier, so the profile records the deletion instead: an
+// empty marker beside where the file would be, named WHITEOUT + its lowercase
+// name. A marked name does not resolve or list from the lower tiers; writing
+// the name again removes the mark. Heroes IV's autosave deletes and renames
+// the saves the game shipped beside, and failed without this.
+const char WHITEOUT[] = ".pop-whiteout-";
+bool split_leaf(const std::string &rel, std::string *dir, std::string *leaf) {
+    std::vector<std::string> comps;
+    if (!split(rel, &comps) || comps.empty())
+        return false;
+    *leaf = comps.back();
+    dir->clear();
+    for (size_t i = 0; i + 1 < comps.size(); ++i)
+        *dir += (i ? "/" : "") + comps[i];
+    return true;
+}
+// The marker's host path in the profile; with `create`, its directory is made.
+bool whiteout_path(const std::string &profile_root, const std::string &rel, bool create,
+                   std::string *out) {
+    std::string dir, leaf, host;
+    if (!split_leaf(rel, &dir, &leaf))
+        return false;
+    if (dir.empty()) {
+        host = profile_root;
+    } else if (!resolve_in(profile_root, dir, create, true, &host)) {
+        return false;
+    } else if (create) {
+        OsStat st;
+        if (os_stat(host.c_str(), &st) != 0 && !mkdirs(host))
+            return false;
+    }
+    *out = host + "/" + WHITEOUT + lower(leaf);
+    return true;
+}
+bool whited_out(const std::string &profile_root, const std::string &rel) {
+    std::string marker;
+    OsStat st;
+    return whiteout_path(profile_root, rel, false, &marker) && os_lstat(marker.c_str(), &st) == 0;
+}
+bool set_whiteout(const std::string &profile_root, const std::string &rel) {
+    std::string marker;
+    if (!whiteout_path(profile_root, rel, true, &marker))
+        return false;
+    FILE *f = fopen(marker.c_str(), "wb");
+    return f && fclose(f) == 0;
+}
+void clear_whiteout(const std::string &profile_root, const std::string &rel) {
+    std::string marker;
+    if (whiteout_path(profile_root, rel, false, &marker))
+        os_unlink(marker.c_str());
+}
+bool in_lower(const std::vector<std::string> &roots, const std::string &rel) {
+    std::string host;
+    for (size_t i = 1; i < roots.size(); ++i)
+        if (resolve_in(roots[i], rel, false, false, &host))
+            return true;
+    return false;
+}
+
 int resolver(const char *relative, int op, char *out, size_t len) {
     std::string host;
     if (!relative || !out || !mods_cpp_overlay_resolve(relative, op, &host) || host.size() >= len)
@@ -312,22 +373,55 @@ bool mods_cpp_overlay_resolve(const std::string &rel, int op, std::string *out) 
     out->clear();
     const auto roots = roots_snapshot();
     if (op == WIN32_FILE_READ || op == WIN32_FILE_LIST) {
-        for (const auto &root : roots)
-            if (resolve_in(root, rel, false, false, out))
+        if (resolve_in(roots[0], rel, false, false, out))
+            return true;
+        if (!rel.empty() && whited_out(roots[0], rel))
+            return false;
+        for (size_t i = 1; i < roots.size(); ++i)
+            if (resolve_in(roots[i], rel, false, false, out))
                 return true;
         return false;
     }
     if (rel.empty())
         return false; // The profile root itself is not an asset.
-    if (op == WIN32_FILE_DELETE || op == WIN32_FILE_RENAME_SRC)
-        return resolve_in(roots[0], rel, false, true, out);
+    if (op == WIN32_FILE_DELETE || op == WIN32_FILE_RENAME_SRC) {
+        // The profile's own copy goes, and the tier below shows through again.
+        if (resolve_in(roots[0], rel, false, true, out))
+            return true;
+        if (whited_out(roots[0], rel) || !in_lower(roots, rel))
+            return false;
+        // Only a lower tier has it. Bring it up - the caller deletes or
+        // renames the profile copy - and mark the name so the lower file
+        // stays hidden afterwards. A delete needs no contents: an empty
+        // placeholder is what gets unlinked.
+        std::string target, source;
+        if (!resolve_in(roots[0], rel, true, true, &target))
+            return false;
+        bool ok;
+        if (op == WIN32_FILE_DELETE) {
+            FILE *f = fopen(target.c_str(), "wb");
+            ok = f && fclose(f) == 0;
+        } else {
+            ok = false;
+            for (size_t i = 1; i < roots.size() && !ok; ++i)
+                if (resolve_in(roots[i], rel, false, false, &source))
+                    ok = copy_up(source, target);
+        }
+        if (!ok || !set_whiteout(roots[0], rel))
+            return false;
+        *out = target;
+        return true;
+    }
     if (op != WIN32_FILE_WRITE && op != WIN32_FILE_RENAME_DST)
         return false;
     std::string target;
     if (!resolve_in(roots[0], rel, true, true, &target))
         return false;
     OsStat st;
-    if (op == WIN32_FILE_WRITE && os_lstat(target.c_str(), &st) != 0) {
+    const bool deleted = whited_out(roots[0], rel);
+    if (deleted)
+        clear_whiteout(roots[0], rel); // the name exists again, and only here
+    if (op == WIN32_FILE_WRITE && !deleted && os_lstat(target.c_str(), &st) != 0) {
         for (size_t i = 1; i < roots.size(); ++i) {
             std::string source;
             if (!resolve_in(roots[i], rel, false, false, &source))
@@ -344,12 +438,17 @@ namespace {
 // Adds each entry of one root to the merged listing, first spelling wins.
 struct ListCollector {
     std::unordered_set<std::string> *seen;
+    std::unordered_set<std::string> *hidden;
     std::vector<std::pair<std::string, std::string>> *out;
     std::string host;
 };
 int collect_listing(const char *name, void *user) {
     ListCollector *c = (ListCollector *)user;
-    if (c->seen->insert(lower(name)).second)
+    const std::string key = lower(name);
+    if (key.compare(0, sizeof WHITEOUT - 1, WHITEOUT) == 0 || c->hidden->count(key) ||
+        key.find(".pop-copy-") != std::string::npos)
+        return 0;
+    if (c->seen->insert(key).second)
         c->out->push_back({name, c->host + "/" + name});
     return 0;
 }
@@ -359,12 +458,22 @@ void mods_cpp_overlay_list(const std::string &rel,
                            std::vector<std::pair<std::string, std::string>> *out) {
     if (!out)
         return;
-    std::unordered_set<std::string> seen;
-    for (const auto &root : roots_snapshot()) {
+    std::unordered_set<std::string> seen, hidden, none;
+    const auto roots = roots_snapshot();
+    for (size_t i = 0; i < roots.size(); ++i) {
         std::string host;
-        if (!resolve_in(root, rel, false, false, &host))
+        if (!resolve_in(roots[i], rel, false, false, &host))
             continue;
-        ListCollector collect{&seen, out, host};
+        if (i == 0) {
+            // The profile's whiteouts hide those names in every tier below.
+            os_listdir(host.c_str(), [](const char *name, void *user) {
+                const std::string key = lower(name);
+                if (key.compare(0, sizeof WHITEOUT - 1, WHITEOUT) == 0)
+                    ((std::unordered_set<std::string> *)user)->insert(key.substr(sizeof WHITEOUT - 1));
+                return 0;
+            }, &hidden);
+        }
+        ListCollector collect{&seen, i == 0 ? &none : &hidden, out, host};
         os_listdir(host.c_str(), collect_listing, &collect);
     }
 }

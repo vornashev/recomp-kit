@@ -28,6 +28,7 @@
 #include <time.h>
 
 #include <map>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -408,9 +409,105 @@ static std::string resolve_in_game_dir(const std::vector<std::string> &norm, boo
     return host;
 }
 
-std::string win32_host_path_op(const std::string &guest_path, int op) {
-    if (guest_path.empty())
+#ifndef RECOMP_ANSI_CODEPAGE
+#define RECOMP_ANSI_CODEPAGE 1252
+#endif
+namespace {
+// Windows-1251's upper half as Unicode code points.
+const uint16_t CP1251_HIGH[128] = {
+    0x0402, 0x0403, 0x201A, 0x0453, 0x201E, 0x2026, 0x2020, 0x2021, 0x20AC, 0x2030, 0x0409, 0x2039,
+    0x040A, 0x040C, 0x040B, 0x040F, 0x0452, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x0098, 0x2122, 0x0459, 0x203A, 0x045A, 0x045C, 0x045B, 0x045F, 0x00A0, 0x040E, 0x045E, 0x0408,
+    0x00A4, 0x0490, 0x00A6, 0x00A7, 0x0401, 0x00A9, 0x0404, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x0407,
+    0x00B0, 0x00B1, 0x0406, 0x0456, 0x0491, 0x00B5, 0x00B6, 0x00B7, 0x0451, 0x2116, 0x0454, 0x00BB,
+    0x0458, 0x0405, 0x0455, 0x0457};
+uint32_t cp1251_unicode(uint8_t b) {
+    if (b < 0x80)
+        return b;
+    if (b >= 0xC0)
+        return 0x0410 + (b - 0xC0); // А..я
+    return CP1251_HIGH[b - 0x80];
+}
+bool valid_utf8(const std::string &s) {
+    for (size_t i = 0; i < s.size();) {
+        uint8_t b = (uint8_t)s[i];
+        size_t n = b < 0x80 ? 0 : (b & 0xE0) == 0xC0 ? 1 : (b & 0xF0) == 0xE0 ? 2 : (b & 0xF8) == 0xF0 ? 3 : 9;
+        if (n == 9 || i + n >= s.size() + (n ? 0 : 1))
+            return false;
+        for (size_t k = 1; k <= n; ++k)
+            if (((uint8_t)s[i + k] & 0xC0) != 0x80)
+                return false;
+        i += n + 1;
+    }
+    return true;
+}
+} // namespace
+
+// A path or name in the game's ANSI code page as the host's UTF-8. Only a
+// localized code page converts: under 1252 the bytes pass through as before.
+// A string that is already UTF-8 (a -W API's path, converted on the way in)
+// is left alone; Cyrillic in 1251 is never valid UTF-8.
+std::string win32_ansi_to_utf8(const std::string &s) {
+    if (RECOMP_ANSI_CODEPAGE != 1251 || valid_utf8(s))
+        return s;
+    std::string out;
+    for (unsigned char ch : s) {
+        uint32_t u = cp1251_unicode(ch);
+        if (u < 0x80) {
+            out += (char)u;
+        } else if (u < 0x800) {
+            out += (char)(0xC0 | (u >> 6));
+            out += (char)(0x80 | (u & 0x3F));
+        } else {
+            out += (char)(0xE0 | (u >> 12));
+            out += (char)(0x80 | ((u >> 6) & 0x3F));
+            out += (char)(0x80 | (u & 0x3F));
+        }
+    }
+    return out;
+}
+// The reverse, for names handed back through -A APIs. A character the code
+// page lacks becomes '?', as WideCharToMultiByte's default character.
+std::string win32_utf8_to_ansi(const std::string &s) {
+    if (RECOMP_ANSI_CODEPAGE != 1251 || !valid_utf8(s))
+        return s;
+    std::string out;
+    for (size_t i = 0; i < s.size();) {
+        uint8_t b = (uint8_t)s[i];
+        uint32_t u;
+        size_t n;
+        if (b < 0x80) {
+            u = b;
+            n = 1;
+        } else if ((b & 0xE0) == 0xC0) {
+            u = ((b & 0x1Fu) << 6) | (s[i + 1] & 0x3F);
+            n = 2;
+        } else if ((b & 0xF0) == 0xE0) {
+            u = ((b & 0x0Fu) << 12) | ((s[i + 1] & 0x3Fu) << 6) | (s[i + 2] & 0x3F);
+            n = 3;
+        } else {
+            u = '?';
+            n = 4;
+        }
+        i += n;
+        char ch = '?';
+        if (u < 0x80)
+            ch = (char)u;
+        else
+            for (int k = 0x80; k < 0x100; ++k)
+                if (cp1251_unicode((uint8_t)k) == u) {
+                    ch = (char)k;
+                    break;
+                }
+        out += ch;
+    }
+    return out;
+}
+
+std::string win32_host_path_op(const std::string &guest_path_in, int op) {
+    if (guest_path_in.empty())
         return std::string();
+    const std::string guest_path = win32_ansi_to_utf8(guest_path_in);
     std::vector<std::string> norm = normalise_components(guest_path);
     if (g_file_resolve) {
         std::string rel = serialise_relative(norm);
@@ -614,8 +711,9 @@ void fill_find_data(uint32_t addr, const std::string &host_path, const std::stri
         gm_put_wstr(addr + 44, name, 260);
         gm_put_wstr(addr + 564, name, 14);
     } else {
-        gm_put_str(addr + 44, name.c_str(), 260);
-        gm_put_str(addr + 304, name.c_str(), 14);
+        const std::string ansi = win32_utf8_to_ansi(name);
+        gm_put_str(addr + 44, ansi.c_str(), 260);
+        gm_put_str(addr + 304, ansi.c_str(), 14);
     }
 }
 
@@ -696,6 +794,7 @@ std::map<uint32_t, VmRegion>::iterator vm_find(uint32_t addr) {
 
 void k_VirtualAlloc(X86 *c) {
     uint32_t addr = arg(c, 0), size = arg(c, 1), type = arg(c, 2);
+    LOGV("VirtualAlloc(%08x, %08x, %08x, %08x)", addr, size, type, arg(c, 3));
     if (size > 0xfffff000u) {
         set_last_error(ERROR_NOT_ENOUGH_MEMORY_);
         set_eax(c, 0);
@@ -719,10 +818,18 @@ void k_VirtualAlloc(X86 *c) {
             set_eax(c, addr);
             return;
         }
-        LOGV("VirtualAlloc: ignoring requested base %08x, no region there", addr);
+        // Windows either places a reservation exactly at the requested base
+        // or fails; it never moves it. Allocators that grow a region in
+        // place (Heroes IV's) treat a different non-null address as theirs.
+        LOGV("VirtualAlloc: %08x is not in a reservation: failing", addr);
+        set_last_error(487); // ERROR_INVALID_ADDRESS
+        set_eax(c, 0);
+        return;
     }
 
-    uint32_t base = heap_alloc(pages, true, 4096);
+    // Reservations start on the 64 KB allocation granularity, as Windows'
+    // do; allocators derive their page groups from that alignment.
+    uint32_t base = heap_alloc(pages, true, 0x10000);
     if (!base) {
         set_last_error(ERROR_NOT_ENOUGH_MEMORY_);
         set_eax(c, 0);
@@ -737,6 +844,7 @@ void k_VirtualAlloc(X86 *c) {
 
 void k_VirtualFree(X86 *c) {
     uint32_t addr = arg(c, 0), size = arg(c, 1), type = arg(c, 2);
+    LOGV("VirtualFree(%08x, %08x, %08x)", addr, size, type);
     auto it = vm_find(addr);
     if (type & 0x8000) { // MEM_RELEASE
         // Win32 releases a whole reservation and only from its base address,
@@ -826,7 +934,9 @@ void k_ReadFile(X86 *c) {
     }
     int64_t n = os_fd_read(o->fd, g_mem + buf, want);
     if (recomp_env("TRACE_FILES"))
-        LOGW("file: read handle=%08x want=%u got=%lld", arg(c, 0), want, (long long)n);
+        LOGW("file: read handle=%08x want=%u got=%lld first=%02x %02x %02x %02x", arg(c, 0), want,
+             (long long)n, n > 0 ? g_mem[buf] : 0, n > 1 ? g_mem[buf + 1] : 0,
+             n > 2 ? g_mem[buf + 2] : 0, n > 3 ? g_mem[buf + 3] : 0);
     if (n < 0) {
         set_last_error(ERROR_ACCESS_DENIED_);
         if (pread)
@@ -1537,6 +1647,10 @@ static uint32_t native_frame_clock(X86 *c) {
         return RECOMP_HOOK_FRAME_CLOCK_WAIT_DEADLINE;
     }
     return 0;
+}
+// VirtualLock(addr, size): guest memory is never paged out; report success.
+void k_VirtualLock(X86 *c) {
+    set_eax(c, 1);
 }
 void k_GetTickCount(X86 *c) {
     const uint32_t draw_deadline = native_frame_clock(c);
@@ -2782,6 +2896,12 @@ void sched_checkpoint() {
     if (threads().size() < 2 || t_atomic)
         return;
     GuestThread *me = threads()[t_self];
+    // The slice is a millisecond and imports come far faster than that; a
+    // clock read for each one was a measurable share of a frame on the web,
+    // where the clock is a call into JavaScript.
+    static thread_local uint32_t calls = 0;
+    if ((++calls & 63) != 0)
+        return;
     double now = sched_now();
     if (now - me->last_yield < SCHED_SLICE_SECONDS)
         return;
@@ -2879,8 +2999,21 @@ uint32_t sched_wait_objects(const uint32_t *handles_, uint32_t count, bool wait_
     return guest_block("wait");
 }
 
+// Guest threads waiting in EnterCriticalSection. Only the thread holding the
+// baton runs guest code, so while none is waiting a section changes hands
+// only between that thread and itself: Enter and Leave then touch the
+// section's guest words directly, with no scheduler lock and no wakeup. A
+// game that brackets every allocation with a section did both over a hundred
+// thousand times a second, and on the web each contended lock is a futex
+// wait through JavaScript.
+std::atomic<int> g_critsec_waiters{0};
+
 void sched_enter_critsec(uint32_t cs) {
     GuestThread *me = cur_thread();
+    if (g_critsec_waiters.load(std::memory_order_acquire) == 0 && critsec_available(cs, me->id)) {
+        critsec_take(cs, me->id);
+        return;
+    }
     g_sched_m.lock();
     if (critsec_available(cs, me->id)) {
         critsec_take(cs, me->id);
@@ -2892,8 +3025,10 @@ void sched_enter_critsec(uint32_t cs) {
     me->wait_cs = cs;
     me->wait_n = 0;
     me->has_deadline = false; // EnterCriticalSection does not time out
+    g_critsec_waiters.fetch_add(1, std::memory_order_acq_rel);
     g_sched_m.unlock();
     guest_block("critical section");
+    g_critsec_waiters.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 bool sched_try_critsec(uint32_t cs) {
@@ -2910,6 +3045,17 @@ void sched_leave_critsec(uint32_t cs) {
     if (!cs || !gm_valid(cs, 24))
         return;
     GuestThread *me = cur_thread();
+    if (g_critsec_waiters.load(std::memory_order_acquire) == 0 &&
+        rd32(cs + CS_OFF_OWNER) == me->id) {
+        uint32_t rec = rd32(cs + CS_OFF_RECURSION);
+        if (rec)
+            --rec;
+        wr32(cs + CS_OFF_RECURSION, rec);
+        wr32(cs + CS_OFF_LOCK_COUNT, rec ? rec - 1 : 0xffffffffu);
+        if (!rec)
+            wr32(cs + CS_OFF_OWNER, 0);
+        return;
+    }
     g_sched_m.lock();
     if (rd32(cs + CS_OFF_OWNER) != me->id) {
         // Leaving a section this thread does not own is a guest bug; Windows
@@ -3534,7 +3680,35 @@ std::vector<uint32_t> win32_return_chain(uint32_t ebp, size_t max) {
 
 namespace {
 
+// The thrown type of an MSVC C++ exception (code 0xE06D7363, args {magic,
+// object, ThrowInfo}): ThrowInfo+12 -> CatchableTypeArray, whose first
+// CatchableType+4 is the TypeDescriptor with its decorated name at +8.
+std::string msvc_thrown_type(uint32_t info) {
+    if (!info || !gm_valid(info, 16))
+        return "(rethrow)";
+    uint32_t cta = rd32(info + 12);
+    if (!cta || !gm_valid(cta, 8))
+        return "?";
+    uint32_t ct = rd32(cta + 4);
+    if (!ct || !gm_valid(ct, 8))
+        return "?";
+    uint32_t td = rd32(ct + 4);
+    return td && gm_valid(td, 12) ? gm_str(td + 8, 256) : "?";
+}
+
 void k_RaiseException(X86 *c) {
+    if (arg(c, 0) == 0xe06d7363u && arg(c, 2) >= 3 && gm_valid(arg(c, 3), 12))
+    {
+        std::string frames;
+        for (uint32_t r : win32_return_chain(c->r[R_EBP], 10)) {
+            char b[16];
+            snprintf(b, sizeof b, " %08x", r);
+            frames += b;
+        }
+        LOGW("C++ exception %s thrown (object %08x) from ret=%08x, frames:%s",
+             msvc_thrown_type(rd32(arg(c, 3) + 8)).c_str(), rd32(arg(c, 3) + 4),
+             rd32(c->r[R_ESP]), frames.c_str());
+    }
     // A raise the guest goes on to handle is invisible in a run log otherwise,
     // and the frames it climbed out of are exactly what a language exception
     // hides: the log shows the dialog that reported it and nothing that led
@@ -3617,7 +3791,7 @@ void k_IsDBCSLeadByte(X86 *c) {
     set_eax(c, 0);
 }
 void k_GetACP(X86 *c) {
-    set_eax(c, 1252);
+    set_eax(c, RECOMP_ANSI_CODEPAGE);
 }
 void k_GetOEMCP(X86 *c) {
     set_eax(c, 437);
@@ -4184,6 +4358,8 @@ void create_file_named(X86 *c, const std::string &name) {
     if (host.empty()) {
         set_last_error(ERROR_FILE_NOT_FOUND_);
         LOGV("CreateFileA(%s): not found", name.c_str());
+        if (getenv("RECOMP_TRACE_FILES"))
+            fprintf(stderr, "[file] open %s: not found\n", name.c_str());
         set_eax(c, INVALID_HANDLE_VALUE_);
         return;
     }
@@ -4224,6 +4400,8 @@ void create_file_named(X86 *c, const std::string &name) {
         handles()[h].guest_name = name;
     }
     set_last_error(ERROR_SUCCESS_);
+    if (getenv("RECOMP_TRACE_FILES"))
+        fprintf(stderr, "[file] open %s -> %s\n", name.c_str(), host.c_str());
     LOGV("CreateFileA(%s) -> %s handle %08x%s", name.c_str(), host.c_str(), h,
          deferred ? " (write tier at the first write)" : "");
     set_eax(c, h);
@@ -4328,8 +4506,9 @@ void copy_file_named(X86 *c, const std::string &source, const std::string &dest)
     set_eax(c, 1);
 }
 
-void find_first_named(X86 *c, const std::string &pattern, bool wide) {
+void find_first_named(X86 *c, const std::string &pattern_in, bool wide) {
     uint32_t data = arg(c, 1);
+    const std::string pattern = win32_ansi_to_utf8(pattern_in);
 
     // Split the pattern into a directory and a leaf mask.
     std::string dirpart, leaf = pattern;
@@ -4817,6 +4996,12 @@ const ImportShim g_kernel32_shims[] = {
     {"KERNEL32.dll", "IsBadCodePtr", 1, k_IsBadCodePtr},
     // time
     {"KERNEL32.dll", "GetTickCount", 0, k_GetTickCount},
+    {"KERNEL32.dll", "VirtualLock", 2, k_VirtualLock},
+    // No other process shares a mutex or a named mapping with the game: the
+    // single-instance probe and the shared-memory lookup find nothing.
+    {"KERNEL32.dll", "OpenMutexA", 3, nullptr},
+    {"KERNEL32.dll", "OpenFileMappingA", 3, nullptr},
+    {"KERNEL32.dll", "MapViewOfFileEx", 6, nullptr},
     {"KERNEL32.dll", "QueryPerformanceCounter", 1, k_QueryPerformanceCounter},
     {"KERNEL32.dll", "QueryPerformanceFrequency", 1, k_QueryPerformanceFrequency},
     {"KERNEL32.dll", "Sleep", 1, k_Sleep},

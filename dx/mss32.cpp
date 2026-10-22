@@ -18,6 +18,9 @@
 #include <vector>
 #include <iterator>
 #include <map>
+#include <cctype>
+#include <cstring>
+#include <string>
 
 namespace {
 
@@ -540,6 +543,205 @@ void ret_done(X86 *c) {
     set_eax(c, SMP_DONE);
 }
 
+// ---------------------------------------------------------------------------
+// RIB / ASI: the provider interface a game uses to decode MP3 itself.
+// RIB_find_files_provider("ASI codec", "Input file types", "*.mp3", ...)
+// names the one provider served here; RIB_request_interface fills a list of
+// 16-byte entries {type, name, token pointer, subtype}: a function entry
+// (type 0) receives a trampoline to the ASI_* shim of that name, an attribute
+// or preference entry receives a handle the ASI_* calls take back. Streams
+// pull their encoded input through the guest's fetch callback
+// (stdcall user, dest, bytes, offset; offset -1 continues sequentially), all
+// of it at open, and decode to interleaved 16-bit PCM on ASI_stream_process.
+// ---------------------------------------------------------------------------
+
+const uint32_t ASI_PROVIDER = 0x41534931; // "ASI1"
+std::vector<std::string> g_asi_attribs;   // handle - 1 -> attribute/preference name
+
+uint32_t asi_attrib_handle(const std::string &name) {
+    for (size_t i = 0; i < g_asi_attribs.size(); ++i)
+        if (g_asi_attribs[i] == name)
+            return (uint32_t)i + 1;
+    g_asi_attribs.push_back(name);
+    return (uint32_t)g_asi_attribs.size();
+}
+
+std::string asi_attrib_name(uint32_t handle) {
+    return handle && handle <= g_asi_attribs.size() ? g_asi_attribs[handle - 1] : std::string();
+}
+
+struct AsiStream {
+    bool alive = false;
+    Mp3Source source;
+    size_t input_bytes = 0;
+    std::vector<int16_t> pending;
+    size_t pending_pos = 0;
+};
+std::vector<AsiStream> g_asi_streams(16);
+
+AsiStream *asi_stream_for(uint32_t handle) {
+    if (!handle || handle > g_asi_streams.size())
+        return nullptr;
+    AsiStream &s = g_asi_streams[handle - 1];
+    return s.alive ? &s : nullptr;
+}
+
+bool ends_with_nocase(const std::string &s, const char *suffix) {
+    size_t n = strlen(suffix);
+    if (s.size() < n)
+        return false;
+    for (size_t i = 0; i < n; ++i)
+        if (tolower((unsigned char)s[s.size() - n + i]) != tolower((unsigned char)suffix[i]))
+            return false;
+    return true;
+}
+
+// RIB_find_files_provider(interface, attrib1, value1, attrib2, value2)
+void rib_find_files_provider(X86 *c) {
+    std::string iface = arg(c, 0) ? gm_str(arg(c, 0)) : std::string();
+    std::string input = arg(c, 2) ? gm_str(arg(c, 2)) : std::string();
+    bool mp3 = iface == "ASI codec" && ends_with_nocase(input, ".mp3");
+    LOGV("mss32: RIB_find_files_provider(%s, %s) -> %s", iface.c_str(), input.c_str(), mp3 ? "ASI" : "none");
+    set_eax(c, mp3 ? ASI_PROVIDER : 0);
+}
+
+// RIB_request_interface(provider, interface name, entry count, entries)
+void rib_request_interface(X86 *c) {
+    uint32_t provider = arg(c, 0), count = arg(c, 2), list = arg(c, 3);
+    std::string iface = arg(c, 1) ? gm_str(arg(c, 1)) : std::string();
+    set_eax(c, 1); // RIB_NOT_ALL_AVAILABLE
+    if (provider != ASI_PROVIDER || !list || count > 256 || !gm_valid(list, count * 16))
+        return;
+    bool all = true;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t e = list + 16 * i, type = rd32(e), token = rd32(e + 8);
+        std::string name = rd32(e + 4) ? gm_str(rd32(e + 4)) : std::string();
+        if (!token || !gm_valid(token, 4))
+            continue;
+        uint32_t value = type == 0 ? imports_resolve("mss32.dll", name.c_str()) : asi_attrib_handle(name);
+        if (!value) {
+            LOGW("mss32: RIB %s: no entry %s", iface.c_str(), name.c_str());
+            all = false;
+        }
+        wr32(token, value);
+    }
+    set_eax(c, all ? 0 : 1);
+}
+
+void asi_error(X86 *c) {
+    static uint32_t empty = 0;
+    if (!empty)
+        empty = heap_alloc(4, true);
+    set_eax(c, empty);
+}
+
+// ASI_stream_open(user, fetch callback, total size)
+void asi_stream_open(X86 *c) {
+    uint32_t user = arg(c, 0), fetch = arg(c, 1), total = arg(c, 2);
+    set_eax(c, 0);
+    const uint32_t chunk = 0x10000, limit = 64u << 20;
+    uint32_t buf = heap_alloc(chunk);
+    if (!buf || !fetch)
+        return;
+    std::vector<uint8_t> bytes;
+    while (bytes.size() < limit && (!total || bytes.size() < total)) {
+        uint32_t want = total ? std::min<uint32_t>(chunk, total - (uint32_t)bytes.size()) : chunk;
+        uint32_t args[4] = {user, buf, want, 0xffffffffu};
+        int32_t got = (int32_t)guest_call(c, fetch, args, 4);
+        if (got <= 0)
+            break;
+        got = std::min<int32_t>(got, (int32_t)want);
+        bytes.insert(bytes.end(), gm_ptr(buf), gm_ptr(buf) + got);
+        if ((uint32_t)got < want)
+            break;
+    }
+    heap_free(buf);
+    for (uint32_t i = 0; i < g_asi_streams.size(); ++i) {
+        AsiStream &s = g_asi_streams[i];
+        if (s.alive)
+            continue;
+        s = AsiStream{};
+        s.input_bytes = bytes.size();
+        if (!s.source.open(bytes)) {
+            LOGW("mss32: ASI_stream_open: %zu bytes are not MPEG audio", bytes.size());
+            return;
+        }
+        s.alive = true;
+        LOGV("mss32: ASI_stream_open -> %u (%zu bytes, %u Hz, %u ch)", i + 1, bytes.size(),
+             s.source.rate(), s.source.channels());
+        set_eax(c, i + 1);
+        return;
+    }
+    LOGW("mss32: ASI_stream_open: no free stream");
+}
+
+// ASI_stream_process(stream, buffer, bytes) -> bytes of 16-bit PCM written
+void asi_stream_process(X86 *c) {
+    AsiStream *s = asi_stream_for(arg(c, 0));
+    uint32_t dest = arg(c, 1), want = arg(c, 2) & ~1u, done = 0;
+    set_eax(c, 0);
+    if (!s || !dest || !gm_valid(dest, want))
+        return;
+    while (done < want) {
+        if (s->pending_pos >= s->pending.size()) {
+            s->pending.clear();
+            s->pending_pos = 0;
+            if (!s->source.decode_next(s->pending) || s->pending.empty())
+                break;
+        }
+        size_t samples = std::min<size_t>((want - done) / 2, s->pending.size() - s->pending_pos);
+        memcpy(gm_ptr(dest + done), s->pending.data() + s->pending_pos, samples * 2);
+        s->pending_pos += samples;
+        done += (uint32_t)samples * 2;
+    }
+    set_eax(c, done);
+}
+
+// ASI_stream_seek(stream, input byte offset); 0 and -1 restart the stream.
+void asi_stream_seek(X86 *c) {
+    AsiStream *s = asi_stream_for(arg(c, 0));
+    int32_t offset = (int32_t)arg(c, 1);
+    set_eax(c, 0);
+    if (!s)
+        return;
+    s->pending.clear();
+    s->pending_pos = 0;
+    uint64_t frame = 0;
+    int64_t frames = offset > 0 && s->input_bytes ? s->source.duration_frames() : -1;
+    if (frames > 0)
+        frame = (uint64_t)frames * (uint64_t)offset / s->input_bytes;
+    s->source.seek_frames(frame);
+}
+
+void asi_stream_close(X86 *c) {
+    if (AsiStream *s = asi_stream_for(arg(c, 0)))
+        *s = AsiStream{};
+    set_eax(c, 0);
+}
+
+// ASI_stream_attribute(stream, attribute handle) -> value
+void asi_stream_attribute(X86 *c) {
+    AsiStream *s = asi_stream_for(arg(c, 0));
+    std::string name = asi_attrib_name(arg(c, 1));
+    uint32_t v = 0;
+    if (s && name == "Output sample rate")
+        v = s->source.rate();
+    else if (s && name == "Output channels")
+        v = s->source.channels();
+    else if (name == "Output bits per sample")
+        v = 16;
+    set_eax(c, v);
+}
+
+// ASI_stream_set_preference(stream, preference handle, value pointer): the
+// decoder takes its format from the MPEG headers, so preferences are noted.
+void asi_stream_set_preference(X86 *c) {
+    uint32_t value = arg(c, 2);
+    LOGV("mss32: ASI preference %s = %d", asi_attrib_name(arg(c, 1)).c_str(),
+         value && gm_valid(value, 4) ? (int32_t)rd32(value) : 0);
+    set_eax(c, 0);
+}
+
 #define AIL(name, bytes, fn) {"mss32.dll", "_AIL_" #name "@" #bytes, (bytes) / 4, fn}
 
 const ImportShim g_mss32_shims[] = {
@@ -589,6 +791,15 @@ const ImportShim g_mss32_shims[] = {
     AIL(set_3D_position, 16, ret0),
     AIL(set_3D_orientation, 28, ret0),
     AIL(3D_update_position, 8, ret0),
+    {"mss32.dll", "_RIB_find_files_provider@20", 5, rib_find_files_provider},
+    {"mss32.dll", "RIB_request_interface", 4, rib_request_interface},
+    {"mss32.dll", "ASI_error", 0, asi_error},
+    {"mss32.dll", "ASI_stream_open", 3, asi_stream_open},
+    {"mss32.dll", "ASI_stream_process", 3, asi_stream_process},
+    {"mss32.dll", "ASI_stream_seek", 2, asi_stream_seek},
+    {"mss32.dll", "ASI_stream_close", 1, asi_stream_close},
+    {"mss32.dll", "ASI_stream_attribute", 2, asi_stream_attribute},
+    {"mss32.dll", "ASI_stream_set_preference", 3, asi_stream_set_preference},
 };
 
 } // namespace

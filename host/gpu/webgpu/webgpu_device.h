@@ -177,6 +177,12 @@ class WebGpuDevice final : public Device {
     size_t ring_chunk_ = 0;
     uint64_t ring_used_ = 0;
     size_t recording_count_ = 0;
+    // Textures the renderer has let go of. Releasing the last JS reference
+    // frees their GPU memory only when the browser collects garbage, which a
+    // game that replaces textures every frame outruns until the device is
+    // lost; they are destroyed explicitly once no recording can name them.
+    std::vector<Tex> graveyard_;
+    void bury_graveyard();
 
     uint64_t next_id_ = 1;
     std::unordered_map<uint64_t, Tex> textures_;

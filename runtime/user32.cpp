@@ -96,6 +96,18 @@ static void post_geometry(uint32_t hwnd, const Window *w, bool moved, bool sized
 }
 
 void store_msg(uint32_t p, const Msg &m) {
+    static const bool trace = getenv("RECOMP_TRACE_MSG") != nullptr;
+    if (trace && m.message >= 0x0200 && m.message <= 0x020a)
+        fprintf(stderr, "[msg] %04x hwnd=%08x wp=%08x lp=%08x pt=(%d,%d)%s\n", m.message, m.hwnd,
+                m.wparam, m.lparam, (int32_t)m.ptx, (int32_t)m.pty, p ? "" : " (no MSG)");
+    // GetKeyState answers for the message being processed: a mouse message
+    // carries the buttons in its MK_* flags, and VK_LBUTTON/VK_RBUTTON/
+    // VK_MBUTTON follow them. Heroes IV's buttons confirm a click this way.
+    if (m.message >= 0x0200 && m.message <= 0x0209) {
+        g_key_state[0x01] = (m.wparam & 0x0001) ? 0x80 : 0x00; // MK_LBUTTON
+        g_key_state[0x02] = (m.wparam & 0x0002) ? 0x80 : 0x00; // MK_RBUTTON
+        g_key_state[0x04] = (m.wparam & 0x0010) ? 0x80 : 0x00; // MK_MBUTTON
+    }
     if (!p)
         return;
     wr32(p + 0, m.hwnd);
@@ -1267,6 +1279,25 @@ void u_DestroyIcon(X86 *c) {
     gdi_delete_icon(arg(c, 0));
     set_eax(c, arg(c, 0) ? 1 : 0);
 }
+// LoadImageA(hinst, name, type, cx, cy, flags): icons, cursors and bitmaps
+// from resources or files. The host paints its own pointer and window icon,
+// so a distinct non-zero handle is all the guest's bookkeeping needs.
+void u_LoadImageA(X86 *c) {
+    set_eax(c, g_next_icon++);
+}
+// Menus and accelerators of a windowed build: the host window has neither, so
+// loading succeeds with a distinct handle and no keystroke is ever translated.
+void u_LoadMenuA(X86 *c) {
+    static uint32_t next = 0x0002c001u;
+    set_eax(c, next++);
+}
+void u_LoadAcceleratorsA(X86 *c) {
+    static uint32_t next = 0x0002d001u;
+    set_eax(c, next++);
+}
+void u_MoveWindow(X86 *c) {
+    set_eax(c, find_window(arg(c, 0)) != nullptr);
+}
 void u_LoadIconA(X86 *c) {
     set_eax(c, 0x00029001);
 }
@@ -1281,6 +1312,13 @@ void u_SetCursorPos(X86 *c) {
     set_eax(c, 1);
 }
 void u_GetCursorPos(X86 *c) {
+    static const bool trace = getenv("RECOMP_TRACE_MSG") != nullptr;
+    static int32_t last_x = -99999, last_y = -99999;
+    if (trace && (g_cursor_x != last_x || g_cursor_y != last_y)) {
+        fprintf(stderr, "[cursor] GetCursorPos -> (%d,%d)\n", g_cursor_x, g_cursor_y);
+        last_x = g_cursor_x;
+        last_y = g_cursor_y;
+    }
     uint32_t p = arg(c, 0);
     if (p) {
         wr32(p, (uint32_t)g_cursor_x);
@@ -1722,6 +1760,11 @@ const ImportShim g_user32_shims[] = {
     {"USER32.dll", "BeginPaint", 2, u_BeginPaint},
     {"USER32.dll", "EndPaint", 2, u_EndPaint},
     {"USER32.dll", "LoadIconA", 2, u_LoadIconA},
+    {"USER32.dll", "LoadImageA", 6, u_LoadImageA},
+    {"USER32.dll", "LoadMenuA", 2, u_LoadMenuA},
+    {"USER32.dll", "LoadAcceleratorsA", 2, u_LoadAcceleratorsA},
+    {"USER32.dll", "TranslateAcceleratorA", 3, nullptr},
+    {"USER32.dll", "MoveWindow", 6, u_MoveWindow},
     {"USER32.dll", "LoadCursorA", 2, u_LoadCursorA},
     {"USER32.dll", "ValidateRect", 2, u_ValidateRect},
     {"USER32.dll", "GetUpdateRect", 3, u_GetUpdateRect},

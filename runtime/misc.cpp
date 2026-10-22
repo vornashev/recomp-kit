@@ -1034,6 +1034,38 @@ void i_ImmSetCompositionWindow(X86 *c) {
 // -------------------------------------------------------------------------
 // WSOCK32: enough for startup probing; real networking is a later task.
 // -------------------------------------------------------------------------
+// Network play is not offered: sockets cannot be created, and the address
+// helpers behave as the real ones do so the game's LAN dialogs still format.
+void w_socket_unavailable(X86 *c) {
+    set_eax(c, 0xffffffffu); // INVALID_SOCKET
+}
+void w_socket_error(X86 *c) {
+    set_eax(c, 0xffffffffu); // SOCKET_ERROR
+}
+void w_htons(X86 *c) {
+    uint32_t v = arg(c, 0) & 0xffff;
+    set_eax(c, ((v & 0xff) << 8) | (v >> 8));
+}
+// inet_addr("a.b.c.d") in network byte order, INADDR_NONE when malformed.
+void w_inet_addr(X86 *c) {
+    uint32_t p = arg(c, 0), parts[4] = {0, 0, 0, 0};
+    std::string text = p && gm_valid(p, 1) ? gm_str(p, 64) : std::string();
+    int n = 0;
+    bool ok = !text.empty();
+    for (size_t i = 0; ok && i <= text.size(); ++i) {
+        char ch = i < text.size() ? text[i] : '.';
+        if (ch == '.') {
+            ok = ++n <= 4 && (i == 0 || text[i - 1] != '.');
+        } else if (ch >= '0' && ch <= '9') {
+            parts[n] = parts[n] * 10 + (uint32_t)(ch - '0');
+            ok = n < 4 && parts[n] <= 255;
+        } else {
+            ok = false;
+        }
+    }
+    ok = ok && n == 4;
+    set_eax(c, ok ? parts[0] | parts[1] << 8 | parts[2] << 16 | parts[3] << 24 : 0xffffffffu);
+}
 void w_WSAStartup(X86 *c) {
     uint32_t version = arg(c, 0), pdata = arg(c, 1);
     if (pdata) {
@@ -2054,6 +2086,19 @@ const ImportShim g_misc_shims[] = {
     // registered under both the ordinal the IAT uses and the documented name
     // (which is what GetProcAddress would ask for).
     {"WSOCK32.dll", "WSAStartup", 2, w_WSAStartup},
+    {"WSOCK32.dll", "socket", 3, w_socket_unavailable},
+    {"WSOCK32.dll", "connect", 3, w_socket_error},
+    {"WSOCK32.dll", "closesocket", 1, nullptr},
+    {"WSOCK32.dll", "getsockname", 3, w_socket_error},
+    {"WSOCK32.dll", "htons", 1, w_htons},
+    {"WSOCK32.dll", "inet_addr", 1, w_inet_addr},
+    // Heroes IV imports these by ordinal.
+    {"WSOCK32.dll", "ord3", 1, nullptr},              // closesocket
+    {"WSOCK32.dll", "ord4", 3, w_socket_error},       // connect
+    {"WSOCK32.dll", "ord6", 3, w_socket_error},       // getsockname
+    {"WSOCK32.dll", "ord9", 1, w_htons},              // htons
+    {"WSOCK32.dll", "ord10", 1, w_inet_addr},         // inet_addr
+    {"WSOCK32.dll", "ord23", 3, w_socket_unavailable}, // socket
     {"WSOCK32.dll", "ord115", 2, w_WSAStartup},
     {"WSOCK32.dll", "WSACleanup", 0, w_WSACleanup},
     {"WSOCK32.dll", "ord116", 0, w_WSACleanup},

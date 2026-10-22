@@ -321,10 +321,22 @@ void WebGpuDevice::destroy(Texture tex) {
     textures_.erase(it);
     if (t.external)
         return;
-    // A texture recorded into a command buffer stays valid until that buffer
-    // is submitted: WebGPU keeps it alive, so releasing our reference is safe.
-    wgpuTextureViewRelease(t.view);
-    wgpuTextureRelease(t.texture);
+    // A texture recorded into a command buffer must not be destroyed before
+    // that buffer is submitted. Without an open recording it can go now -
+    // WebGPU defers the free until submitted work is done - otherwise it waits
+    // for the last open recording to be committed.
+    graveyard_.push_back(t);
+    if (recording_count_ == 0)
+        bury_graveyard();
+}
+
+void WebGpuDevice::bury_graveyard() {
+    for (Tex &t : graveyard_) {
+        wgpuTextureViewRelease(t.view);
+        wgpuTextureDestroy(t.texture);
+        wgpuTextureRelease(t.texture);
+    }
+    graveyard_.clear();
 }
 
 TextureDesc WebGpuDevice::describe(Texture tex) {
@@ -976,6 +988,7 @@ void WebGpuDevice::commit(CommandBuffer cb) {
         // Nothing recording can name an earlier ring offset any more.
         ring_chunk_ = 0;
         ring_used_ = 0;
+        bury_graveyard();
     }
     const double submitted = now_seconds();
     const uint64_t id = cb.id;
