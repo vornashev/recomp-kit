@@ -61,6 +61,27 @@ instruction or table shape it does not handle.
 The differential harness compares translated routines with original instructions
 under Unicorn. Unicorn is a development tool, not part of the playable app.
 
+## Web cache checks
+
+The web cache also has a synthetic Wasm/Node suite. With the Emscripten SDK
+environment loaded, run from the kit root (no game files required):
+
+```sh
+.venv/bin/python - <<'PY'
+import sys
+sys.path.insert(0, "tools")
+import build
+build.configure("web-stub", ["-DRECOMP_VIDEO=OFF"])
+build.build("web-stub", ["web_remote_fs_tests"], 2)
+PY
+.venv/bin/ctest --test-dir build/cmake/web-stub -R '^web_remote_fs_tests$' --output-on-failure
+```
+
+This exercises the production WasmFS cache with synthetic HTTP responses,
+including concurrent misses, duplicate-request suppression, failure wakeups,
+bounded persistence, retry discovery and EOF. Browser OPFS and real network
+latency still require the manual checks below.
+
 ## Manual gameplay checks
 
 - Start a level, select a person, issue a move order and observe the destination.

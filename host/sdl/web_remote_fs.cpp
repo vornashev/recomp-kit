@@ -87,10 +87,10 @@ EM_JS(char *, remote_fetch_text, (const char *url), {
 
 namespace {
 using wasmfs::DataFile;
+using wasmfs::Directory;
+using wasmfs::File;
 using wasmfs::MemoryDirectory;
 using wasmfs::Symlink;
-using wasmfs::File;
-using wasmfs::Directory;
 using RemoteBackendId = wasmfs::backend_t;
 
 constexpr uint64_t CHUNK = 256u << 10;
@@ -197,6 +197,9 @@ struct Pending {
     std::vector<uint8_t> bytes;
 };
 std::deque<Pending> g_pending;
+size_t g_pending_bytes = 0;
+constexpr size_t MAX_PENDING_BYTES = 32u << 20;
+constexpr size_t PREFETCH_PENDING_BYTES = MAX_PENDING_BYTES / 2;
 std::set<RemoteFile *> g_dirty_maps; // files whose chunk map has to be written again
 std::condition_variable g_pending_cv;
 uint64_t g_fetched_bytes = 0, g_fetches = 0;
@@ -220,8 +223,8 @@ void note_wait(double ms, const char *what, const std::string &rel, uint64_t ind
     if (ms > g_wait_max_ms)
         g_wait_max_ms = ms;
     if (tracing() && ms >= 100)
-        fprintf(stderr, "[remote] the game waited %.0f ms for %s chunk %llu (%s)\n", ms, rel.c_str(),
-                (unsigned long long)index, what);
+        fprintf(stderr, "[remote] the game waited %.0f ms for %s chunk %llu (%s)\n", ms,
+                rel.c_str(), (unsigned long long)index, what);
 }
 constexpr double QUIET_MS = 400;
 // The fill waits longer: loading a map reads in bursts a second apart, and a
@@ -258,7 +261,7 @@ class RemoteFile : public DataFile {
     bool cache_ok_ = false, cache_tried_ = false;
     uint64_t next_offset_ = UINT64_MAX, ahead_ = 1;
     uint64_t ahead_posted_ = UINT64_MAX; // last chunk handed to the background
-    bool missed_ = false; // the read in progress waited on the network
+    bool missed_ = false;                // the read in progress waited on the network
 
     std::string cache_base() const {
         return g_cache_dir + "/" + rel_;
@@ -282,7 +285,8 @@ class RemoteFile : public DataFile {
             return;
         unsigned long long size = 0, stamp = 0, chunk = 0;
         const bool current = fscanf(map, "%llu %llu %llu", &size, &stamp, &chunk) == 3 &&
-                             fgetc(map) == '\n' && size == size_ && stamp == stamp_ && chunk == CHUNK;
+                             fgetc(map) == '\n' && size == size_ && stamp == stamp_ &&
+                             chunk == CHUNK;
         if (!current || fread(have_.data(), 1, have_.size(), map) != have_.size())
             std::fill(have_.begin(), have_.end(), 0);
         fclose(map);
@@ -290,14 +294,22 @@ class RemoteFile : public DataFile {
     uint64_t chunk_len(uint64_t index) const {
         return std::min<uint64_t>(CHUNK, size_ - index * CHUNK);
     }
-    const std::vector<uint8_t> *from_storage(uint64_t index) {
+    const std::vector<uint8_t> *from_storage(uint64_t index, std::unique_lock<std::mutex> &hold) {
         if (!cache_ok_ || !have_[index])
             return nullptr;
         std::vector<uint8_t> bytes(chunk_len(index));
-        FILE *f = fopen(chunk_path(index).c_str(), "rb");
+        const std::string path = chunk_path(index);
+        // OPFS can proxy to another worker. Reserve this chunk, but let
+        // unrelated reads and the keeper make progress while storage waits.
+        g_inflight.insert({this, index});
+        hold.unlock();
+        FILE *f = fopen(path.c_str(), "rb");
         const bool ok = f && fread(bytes.data(), 1, bytes.size(), f) == bytes.size();
         if (f)
             fclose(f);
+        hold.lock();
+        g_inflight.erase({this, index});
+        g_landed.notify_all();
         if (!ok) {
             have_[index] = 0; // lost: fetch it again
             return nullptr;
@@ -306,15 +318,25 @@ class RemoteFile : public DataFile {
     }
     // Fetches chunk `index` and the missing ones after it up to `until`
     // (inclusive) in one request, and keeps each in memory and in storage.
-    bool fetch_run(uint64_t index, uint64_t until) {
+    bool fetch_run(uint64_t index, uint64_t until, std::unique_lock<std::mutex> &hold) {
         uint64_t end = index;
-        while (end + 1 <= until && end + 1 < have_.size() && !have_[end + 1] && !ram_find(this, end + 1) &&
-               !inflight(this, end + 1))
+        while (end + 1 <= until && end + 1 < have_.size() && !have_[end + 1] &&
+               !ram_find(this, end + 1) && !inflight(this, end + 1) &&
+               end + 1 - index < PREFETCH_RUN)
             ++end;
         const uint64_t from = index * CHUNK, to = std::min<uint64_t>((end + 1) * CHUNK, size_) - 1;
         std::vector<uint8_t> run(to - from + 1);
         const std::string url = g_base_url + "/" + rel_;
-        if (remote_fetch_range(url.c_str(), (double)from, (double)to, run.data()) != (double)run.size()) {
+        for (uint64_t k = index; k <= end; ++k)
+            g_inflight.insert({this, k});
+        hold.unlock();
+        const bool ok = remote_fetch_range(url.c_str(), (double)from, (double)to, run.data()) ==
+                        (double)run.size();
+        hold.lock();
+        for (uint64_t k = index; k <= end; ++k)
+            g_inflight.erase({this, k});
+        g_landed.notify_all();
+        if (!ok) {
             fprintf(stderr, "[remote] %s: range %llu-%llu failed\n", rel_.c_str(),
                     (unsigned long long)from, (unsigned long long)to);
             return false;
@@ -325,9 +347,11 @@ class RemoteFile : public DataFile {
             fprintf(stderr, "[remote] fetch %s @%llu +%zu (asked chunk %llu)\n", rel_.c_str(),
                     (unsigned long long)from, run.size(), (unsigned long long)index);
         if ((++g_fetches & 31) == 0)
-            fprintf(stderr, "[remote] %llu requests, %.1f MB fetched; the game waited %.1f s in all, "
-                            "%.0f ms at most\n",
-                    (unsigned long long)g_fetches, g_fetched_bytes / 1e6, g_wait_ms / 1000.0, g_wait_max_ms);
+            fprintf(stderr,
+                    "[remote] %llu requests, %.1f MB fetched; the game waited %.1f s in all, "
+                    "%.0f ms at most\n",
+                    (unsigned long long)g_fetches, g_fetched_bytes / 1e6, g_wait_ms / 1000.0,
+                    g_wait_max_ms);
         for (uint64_t k = index; k <= end; ++k) {
             const uint64_t at = (k - index) * CHUNK;
             std::vector<uint8_t> bytes(run.begin() + at, run.begin() + at + chunk_len(k));
@@ -343,7 +367,13 @@ class RemoteFile : public DataFile {
         for (const Pending &p : g_pending)
             if (p.file == this && p.index == k)
                 return;
+        // Persistence is optional: a slow/full disk must not make the game
+        // wait or let background downloads consume an unbounded Wasm heap.
+        // Foreground data remains in RAM; a later fill retries persistence.
+        if (bytes.size() > MAX_PENDING_BYTES - g_pending_bytes)
+            return;
         g_pending.push_back({this, k, bytes});
+        g_pending_bytes += bytes.size();
         g_pending_cv.notify_one();
     }
     // Under g_lock: a chunk on its way to storage, back into memory.
@@ -353,10 +383,11 @@ class RemoteFile : public DataFile {
                 return ram_put(this, index, p.bytes);
         return nullptr;
     }
-    const std::vector<uint8_t> *chunk(uint64_t index, uint64_t until, std::unique_lock<std::mutex> &hold) {
+    const std::vector<uint8_t> *chunk(uint64_t index, uint64_t until,
+                                      std::unique_lock<std::mutex> &hold) {
         if (auto *hit = ram_find(this, index))
             return hit;
-        if (inflight(this, index)) {
+        while (inflight(this, index)) {
             ++g_readers_waiting;
             const double t0 = emscripten_get_now();
             stat_set(S_WAIT_BYTES, (double)chunk_len(index));
@@ -372,13 +403,13 @@ class RemoteFile : public DataFile {
         }
         if (auto *hit = from_pending(index))
             return hit;
-        if (auto *hit = from_storage(index))
+        if (auto *hit = from_storage(index, hold))
             return hit;
         ++g_readers_waiting;
         const double t0 = emscripten_get_now();
         stat_set(S_WAIT_BYTES, (double)run_bytes(index, until));
         stat_set(S_WAIT_SINCE, t0);
-        const bool fetched = fetch_run(index, until);
+        const bool fetched = fetch_run(index, until, hold);
         stat_set(S_WAIT_SINCE, 0);
         g_last_read_fetch = emscripten_get_now();
         note_wait(g_last_read_fetch.load() - t0, "its own request", rel_, index);
@@ -397,15 +428,17 @@ class RemoteFile : public DataFile {
     // For the prefetcher, all under g_lock. The first chunk from `*index` up
     // to `last` that is neither stored nor in memory, and how far the missing
     // run after it goes (at most PREFETCH_RUN chunks); false when none is.
-    bool next_missing(uint64_t *index, uint64_t last, uint64_t *end, uint64_t max_run = PREFETCH_RUN) {
+    bool next_missing(uint64_t *index, uint64_t last, uint64_t *end,
+                      uint64_t max_run = PREFETCH_RUN, bool stored_only = false) {
         load_cache();
         last = std::min<uint64_t>(last, have_.size() - 1);
         const auto present = [&](uint64_t k) {
             if (have_[k] || inflight(this, k))
                 return true;
-            for (const auto &r : g_ram)
-                if (r.file == this && r.index == k)
-                    return true;
+            if (!stored_only)
+                for (const auto &r : g_ram)
+                    if (r.file == this && r.index == k)
+                        return true;
             for (const Pending &p : g_pending)
                 if (p.file == this && p.index == k)
                     return true;
@@ -614,7 +647,8 @@ void fetch_pack() {
     const double started = emscripten_get_now();
     std::vector<uint8_t> pack(g_pack_size);
     const std::string url = g_base_url + "/" + g_pack_name;
-    if (remote_fetch_range(url.c_str(), 0, (double)g_pack_size - 1, pack.data()) != (double)g_pack_size) {
+    if (remote_fetch_range(url.c_str(), 0, (double)g_pack_size - 1, pack.data()) !=
+        (double)g_pack_size) {
         fprintf(stderr, "[remote] %s could not be fetched\n", g_pack_name.c_str());
         stat_set(S_PACK_DONE, (double)g_pack_size); // the files come one by one instead
         return;
@@ -629,8 +663,8 @@ void fetch_pack() {
         p.file->store(0, part);
     }
     stat_set(S_PACK_DONE, (double)g_pack_size);
-    fprintf(stderr, "[remote] %zu small files (%.1f MB) fetched in one request in %.1f s\n", g_pack.size(),
-            g_pack_size / 1e6, (emscripten_get_now() - started) / 1000.0);
+    fprintf(stderr, "[remote] %zu small files (%.1f MB) fetched in one request in %.1f s\n",
+            g_pack.size(), g_pack_size / 1e6, (emscripten_get_now() - started) / 1000.0);
 }
 
 // What the background threads fetch, most urgent first: read-ahead for the
@@ -641,7 +675,7 @@ struct Range {
     RemoteFile *file;
     uint64_t first, last;
 };
-std::deque<Range> g_ahead; // under g_lock
+std::deque<Range> g_ahead;        // under g_lock
 std::vector<RemoteFile *> g_fill; // every file, the order they are filled in
 size_t g_fill_file = 0;           // under g_lock
 uint64_t g_fill_chunk = 0;        // under g_lock
@@ -703,7 +737,7 @@ bool take_fill(Job *job) {
         // more away, smaller requests are mostly waiting for the answer, and
         // a read the game starts meanwhile shares the connection with one at
         // most.
-        if (f->next_missing(&at, f->chunks() - 1, &end, PREFETCH_RUN)) {
+        if (f->next_missing(&at, f->chunks() - 1, &end, PREFETCH_RUN, true)) {
             *job = {f, at, end, 2};
             g_fill_chunk = end + 1;
             return true;
@@ -745,7 +779,9 @@ void keeper() {
             const bool ok = job->file->write_kept(job->index, job->bytes);
             std::lock_guard<std::mutex> hold(g_lock);
             job->file->kept(job->index, ok);
+            g_pending_bytes -= job->bytes.size();
             g_pending.pop_front();
+            g_pending_cv.notify_all();
             continue;
         }
         for (const auto &m : maps)
@@ -785,31 +821,54 @@ void prefetch_worker() {
         Job job;
         bool got = false;
         {
-            std::lock_guard<std::mutex> hold(g_lock);
+            std::unique_lock<std::mutex> hold(g_lock);
+            // Leave space for foreground misses and the short requests that
+            // are already in flight. The keeper never waits on this budget.
+            if (g_pending_bytes >= PREFETCH_PENDING_BYTES) {
+                hold.unlock();
+                emscripten_thread_sleep(20);
+                continue;
+            }
             got = take_from(g_ahead, &job, 0);
             // Background work only in a quiet moment: the game's reads come
             // in bursts, and a request started inside one sits in front of
             // the next read.
             const int fill_mode = g_fill_mode.load();
-            if (!got && (fill_mode == 2 || emscripten_get_now() - g_last_read_fetch.load() >= QUIET_MS)) {
+            if (!got &&
+                (fill_mode == 2 || emscripten_get_now() - g_last_read_fetch.load() >= QUIET_MS)) {
                 got = take_hot(&job);
                 if (!got && !g_hot_done.load())
                     stat_set(S_HOT_DONE, g_stats[S_HOT_TOTAL].load());
                 if (!got && !g_hot_done.exchange(true) && !g_hot.empty())
-                    fprintf(stderr, "[remote] hot list ready: %.1f MB fetched ahead in %.1f s; the "
-                                    "game waited %.1f s on the network so far\n",
+                    fprintf(stderr,
+                            "[remote] hot list ready: %.1f MB fetched ahead in %.1f s; the "
+                            "game waited %.1f s on the network so far\n",
                             g_prefetched.load() / 1e6, (emscripten_get_now() - started) / 1000.0,
                             g_wait_ms / 1000.0);
                 // Eager (the page's "fetch it all now") runs two at a time and
                 // does not wait for the game to be quiet.
                 if (!got && fill_mode && g_fill_active < (fill_mode == 2 ? 2 : 1) &&
-                    (fill_mode == 2 || emscripten_get_now() - g_last_read_fetch.load() >= FILL_QUIET_MS)) {
+                    (fill_mode == 2 ||
+                     emscripten_get_now() - g_last_read_fetch.load() >= FILL_QUIET_MS)) {
                     got = take_fill(&job);
-                    if (!got && !g_fill_active)
-                        stat_set(S_FILL_DONE, 1);
-                    if (!got && !g_fill_active && !g_fill_done.exchange(true))
-                        fprintf(stderr, "[remote] the whole game is in this browser now (%.1f MB "
-                                        "filled in the background)\n", g_filled.load() / 1e6);
+                    if (!got && !g_fill_active && g_pending.empty()) {
+                        const bool complete =
+                            std::all_of(g_fill.begin(), g_fill.end(),
+                                        [](RemoteFile *f) { return f->complete(); });
+                        if (complete) {
+                            stat_set(S_FILL_DONE, 1);
+                            if (!g_fill_done.exchange(true))
+                                fprintf(stderr,
+                                        "[remote] the whole game is in this browser now "
+                                        "(%.1f MB filled in the background)\n",
+                                        g_filled.load() / 1e6);
+                        } else {
+                            // Failed requests and chunks that could not fit
+                            // the write queue must be retried on a later pass.
+                            g_fill_file = 0;
+                            g_fill_chunk = 0;
+                        }
+                    }
                 }
             }
             if (got) {
@@ -826,12 +885,16 @@ void prefetch_worker() {
         const std::string url = g_base_url + "/" + job.file->rel();
         const double from = (double)(job.at * CHUNK);
         const double fetch_started = emscripten_get_now();
-        const bool ok = remote_fetch_range(url.c_str(), from, from + (double)bytes - 1, run.data()) == (double)bytes;
+        const bool ok = remote_fetch_range(url.c_str(), from, from + (double)bytes - 1,
+                                           run.data()) == (double)bytes;
         const double fetch_ms = emscripten_get_now() - fetch_started;
         if (tracing())
             fprintf(stderr, "[remote] background %s %s chunks %llu-%llu: %.0f ms\n",
-                    job.kind == 0 ? "read-ahead" : job.kind == 1 ? "hot" : "fill", job.file->rel().c_str(),
-                    (unsigned long long)job.at, (unsigned long long)job.end, fetch_ms);
+                    job.kind == 0   ? "read-ahead"
+                    : job.kind == 1 ? "hot"
+                                    : "fill",
+                    job.file->rel().c_str(), (unsigned long long)job.at,
+                    (unsigned long long)job.end, fetch_ms);
         {
             std::lock_guard<std::mutex> hold(g_lock);
             if (ok)
@@ -919,7 +982,8 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
     auto owned = std::make_unique<RemoteBackend>();
     RemoteBackend *backend = owned.get();
     RemoteBackendId id = wasmfs::wasmFS.addBackend(std::move(owned));
-    if (wasmfs_create_directory(mount, 0555, reinterpret_cast<::backend_t>(id)) != 0 || !backend->root) {
+    if (wasmfs_create_directory(mount, 0555, reinterpret_cast<::backend_t>(id)) != 0 ||
+        !backend->root) {
         free(manifest);
         return false;
     }
@@ -966,8 +1030,8 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
         bytes += size;
     }
     free(manifest);
-    fprintf(stderr, "[remote] %s: %zu files, %.0f MB, streamed from %s\n", mount, files, bytes / 1e6,
-            g_base_url.c_str());
+    fprintf(stderr, "[remote] %s: %zu files, %.0f MB, streamed from %s\n", mount, files,
+            bytes / 1e6, g_base_url.c_str());
     char *hot = remote_fetch_text((g_base_url + "/hot.txt").c_str());
     if (hot) {
         for (char *line = strtok(hot, "\n"); line; line = strtok(nullptr, "\n")) {
@@ -978,7 +1042,8 @@ bool web_remote_mount(const char *base_url, const char *mount, const char *cache
             *tab1 = 0;
             auto it = by_path.find(line);
             if (it != by_path.end())
-                g_hot.push_back({it->second, strtoull(tab1 + 1, nullptr, 10), strtoull(tab2 + 1, nullptr, 10)});
+                g_hot.push_back(
+                    {it->second, strtoull(tab1 + 1, nullptr, 10), strtoull(tab2 + 1, nullptr, 10)});
         }
         free(hot);
         fprintf(stderr, "[remote] fetching %zu hot ranges ahead\n", g_hot.size());

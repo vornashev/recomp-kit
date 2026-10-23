@@ -9,6 +9,15 @@ set(POP_WARN_GEN -Wall -Wextra -Wno-unused)
 # -O1 for hosts and tests. A Debug configuration leaves this out and gets -O0.
 function(pop_optimize target level)
   target_compile_options(${target} PRIVATE $<$<NOT:$<CONFIG:Debug>>:-O${level}>)
+  # Emscripten runs the Wasm/JS optimizer at link time, independently of
+  # Clang's per-file optimization. Compile-only -O2 leaves that pass off.
+  # Release DWARF also limits Binaryen to debug-preserving passes: strip it
+  # before optimization, rather than only from the published Wasm afterward.
+  if(EMSCRIPTEN)
+    target_link_options(${target} PRIVATE
+      $<$<NOT:$<CONFIG:Debug>>:-O${level}>
+      $<$<NOT:$<CONFIG:Debug>>:-g0>)
+  endif()
 endfunction()
 
 # Every test executable registers here so `check_binaries` builds exactly the

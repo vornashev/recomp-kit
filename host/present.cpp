@@ -185,6 +185,11 @@ extern "C" void host_present(const void *pixels, int w, int h, int bpp, const ui
     if (!stage && !dump)
         return;
     const uint8_t *frame = (const uint8_t *)pixels;
+    // The browser presenter can expand the original packed pixels with the
+    // existing surface-upload shader, without a CPU RGBA pass or a proxy
+    // round trip to the main thread. Dumps still use the reference CPU path.
+    if (stage && !dump && host_present_stage_pixels(frame, w, h, bpp, palette, pitch))
+        return;
     g_staged.rgba.resize((size_t)w * (size_t)h * 4);
     if (bpp == 8)
         host_present_expand_indexed(frame, w, h, pitch, palette, g_staged.rgba.data());
@@ -262,6 +267,19 @@ extern "C" void host_display_present_window(const uint32_t *argb, int w, int h) 
     if (g_mode_w != w || g_mode_h != h || g_mode_bpp != 32)
         host_set_display_mode(w, h, 32);
     host_present_first_write();
+    {
+        ReportLock held;
+        ++g_present_count;
+    }
+    // The settings page's input is registered on the first frame a host draws;
+    // a program that only ever presents windows (a D3D11 renderer, the VCL)
+    // reaches no other present, and F10 would open nothing.
+    host_page_overlay(nullptr, w, h, 32, w * 4, nullptr);
+    if (host_present_stage_pixels(reinterpret_cast<const uint8_t *>(argb), w, h, 32, nullptr,
+                                  w * 4)) {
+        host_present_seal_window();
+        return;
+    }
     const size_t n = size_t(w) * h;
     std::vector<uint8_t> rgba(n * 4);
     // Word to word through plain pointers, which the compiler vectorizes; the
@@ -273,14 +291,6 @@ extern "C" void host_display_present_window(const uint32_t *argb, int w, int h) 
         const uint32_t out = 0xff000000u | (v & 0xffu) << 16 | (v & 0xff00u) | (v >> 16 & 0xffu);
         memcpy(dst + 4 * i, &out, 4);
     }
-    {
-        ReportLock held;
-        ++g_present_count;
-    }
-    // The settings page's input is registered on the first frame a host draws;
-    // a program that only ever presents windows (a D3D11 renderer, the VCL)
-    // reaches no other present, and F10 would open nothing.
-    host_page_overlay(nullptr, w, h, 32, w * 4, nullptr);
     host_present_stage_rgba(rgba.data(), w, h);
     host_present_seal_window();
 }

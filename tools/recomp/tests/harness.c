@@ -64,8 +64,9 @@ int recomp_module_call(X86 *c, uint32_t target) {
 void recomp_callback_return(X86 *c) {
     (void)c;
 }
-void recomp_div_error(X86 *c, uint32_t addr) {
+void recomp_div_error(X86 *c, uint32_t addr, int overflow) {
     (void)c;
+    (void)overflow;
     last_div_error = addr;
     last_div_error_count++;
 }

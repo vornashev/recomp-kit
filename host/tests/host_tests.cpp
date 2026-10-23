@@ -5672,6 +5672,31 @@ static void test_presenter_migration_cancels_old_drawable() {
     host_present_stop();
 }
 
+static void test_browser_refresh_period() {
+    RefreshPeriod refresh;
+    double now = 0, period = refresh.observe(now);
+    CHECK_NEAR(period, 1.0 / 60, 1e-9);
+    for (int i = 0; i < 90; ++i) {
+        now += (i % 11 == 0 ? 2 : 1) / 120.0;
+        period = refresh.observe(now);
+    }
+    CHECK_NEAR(period, 1.0 / 120, 1e-9); // occasional missed ticks are not 60Hz
+    CHECK_NEAR(refresh.observe(NAN), period, 1e-9);
+    CHECK_NEAR(refresh.observe(-1), period, 1e-9);
+    now += 10;
+    CHECK_NEAR(refresh.observe(now), period, 1e-9); // returning from a background tab
+    for (int i = 0; i < 45; ++i) {
+        now += 1.0 / 144;
+        period = refresh.observe(now);
+    }
+    CHECK_NEAR(period, 1.0 / 144, 1e-9);
+    for (int i = 0; i < 45; ++i) {
+        now += 1.0 / 60;
+        period = refresh.observe(now);
+    }
+    CHECK_NEAR(period, 1.0 / 60, 1e-9); // moving to a slower display
+}
+
 static void test_presenter_real_offscreen(D3DRenderer *renderer) {
     // Drive the GDI seam through a real offscreen target; source mutation
     // after publication must not change the completed frame.
@@ -5716,6 +5741,69 @@ static void test_presenter_real_offscreen(D3DRenderer *renderer) {
     double minimum = 0, elapsed = 0;
     CHECK_EQ(host_metric_continuous(&minimum, &elapsed), 0);
     host_present_stop();
+}
+
+// Compare the deferred GPU conversion against the old CPU expansion. Odd
+// widths and padded input rows catch packed-buffer alignment errors; cycling
+// formats/dimensions reuses pooled slots. Mutations after seal must be invisible.
+static void test_presenter_packed_offscreen(D3DRenderer *renderer) {
+    host_present_set_deferred_uploads(true);
+    test_presenter_real_offscreen(renderer); // also covers GDI and direct RGBA
+    host_present_start_offscreen(3, 2);
+    uint64_t id = 0;
+    for (int w : {3, 5}) {
+        const int h = 2;
+        host_present_resize(w, h);
+        for (int cycle = 0; cycle < 3; ++cycle) {
+            for (int bpp : {8, 16, 32}) {
+                const int pitch = w * (bpp / 8) + 6;
+                std::vector<uint8_t> source(size_t(pitch) * h, 0xaa);
+                uint32_t palette[256]{};
+                for (int i = 0; i < 256; ++i)
+                    palette[i] = ((i * 29 & 255) << 16) | ((i * 73 & 255) << 8) | (i * 11 & 255);
+                const uint16_t colors[] = {0xf800, 0x07e0, 0x001f, 0x8430, 0x2925};
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        auto p = source.data() + y * pitch + x * (bpp / 8);
+                        const int i = (x + y + cycle) % 5;
+                        if (bpp == 8)
+                            *p = uint8_t(i + 17);
+                        else if (bpp == 16)
+                            memcpy(p, &colors[i], 2);
+                        else {
+                            const uint32_t color = palette[i + 17];
+                            memcpy(p, &color, 4);
+                        }
+                    }
+                std::vector<uint8_t> expected(size_t(w) * h * 4), shown(expected.size());
+                const uint32_t *pal = cycle == 1 ? nullptr : palette;
+                if (bpp == 8)
+                    host_present_expand_indexed(source.data(), w, h, pitch, pal, expected.data());
+                else if (bpp == 16)
+                    host_present_expand_rgb565(source.data(), w, h, pitch, expected.data());
+                else
+                    host_present_expand_xrgb8888(source.data(), w, h, pitch, expected.data());
+                // Earlier staging in the same frame is superseded before GPU upload.
+                std::vector<uint8_t> black(source.size());
+                CHECK(host_present_stage_pixels(black.data(), w, h, bpp, nullptr, pitch));
+                CHECK(host_present_stage_pixels(source.data(), w, h, bpp, pal, pitch));
+                const auto before = host_present_unique_completed();
+                host_present_test_seal(++id, HOST_SCREEN_MENU, false);
+                std::fill(source.begin(), source.end(), 0);
+                memset(palette, 0, sizeof palette);
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (host_present_unique_completed() == before &&
+                       std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::yield();
+                CHECK_EQ(host_present_unique_completed(), before + 1);
+                CHECK(host_present_test_read_rgba(shown.data(), shown.size()));
+                for (size_t i = 0; i < expected.size(); ++i)
+                    CHECK_EQ(shown[i], expected[i]);
+            }
+        }
+    }
+    host_present_stop();
+    host_present_set_deferred_uploads(false);
 }
 
 // GPU copies preserve their source byte order, including when a pooled frame
@@ -6422,6 +6510,7 @@ static void test_gdi_window_presentation() {
 
 static void test_d3d11_sealed_presentation();
 static void test_presentation_service() {
+    test_browser_refresh_period();
     test_gdi_window_presentation();
     test_d3d11_sealed_presentation();
     test_windowed_first_blit_presents_without_prior_completion();
@@ -9810,6 +9899,7 @@ int main(int argc, char **argv) {
             if (!renderer)
                 return 1;
             test_presenter_real_offscreen(renderer);
+            test_presenter_packed_offscreen(renderer);
             test_presenter_incremental_world_and_overlay(renderer);
             test_wide_scene_pixels(renderer);
             test_native_tile_borders(renderer);
@@ -9954,6 +10044,7 @@ int main(int argc, char **argv) {
             void (*fn)(D3DRenderer *);
         } gpu[] = {
             {"offscreen presenter", test_presenter_real_offscreen},
+            {"packed presenter", test_presenter_packed_offscreen},
             {"presenter GPU color order", test_presenter_gpu_color_order},
             {"presenter GPU logical coordinates", test_presenter_gpu_logical_coordinates},
             {"Direct3D 11 hardware path", test_gpu2d_pixels},

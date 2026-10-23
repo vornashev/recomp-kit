@@ -1,9 +1,41 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <deque>
 #include <vector>
+
+// Estimate the browser's refresh period from recent animation-frame callbacks.
+// Ignore pauses/background gaps and use the median so a few missed refreshes
+// do not immediately double the queue's timing allowance. Never changes the
+// guest's simulation or animation clock.
+class RefreshPeriod {
+    double last = -1, period = 1.0 / 60;
+    std::array<double, 31> intervals{};
+    size_t count = 0, next = 0;
+
+  public:
+    double observe(double now) {
+        if (!std::isfinite(now) || now < 0 || now <= last)
+            return period;
+        const double dt = now - last;
+        last = now;
+        if (dt < 1.0 / 500 || dt > 0.1) {
+            count = next = 0;
+            return period;
+        }
+        intervals[next] = dt;
+        next = (next + 1) % intervals.size();
+        count = std::min(count + 1, intervals.size());
+        if (count >= 15) {
+            auto sorted = intervals;
+            std::nth_element(sorted.begin(), sorted.begin() + count / 2, sorted.begin() + count);
+            period = sorted[count / 2];
+        }
+        return period;
+    }
+};
 
 // Monotonic seconds; no display-link tick or GPU submission is counted as a
 // displayed frame. Offscreen/fallback completions are deliberately excluded.

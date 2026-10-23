@@ -1629,10 +1629,11 @@ void web_frame() {
                     return;
                 }
                 var box = document.createElement("div");
-                box.style.cssText = "position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);" +
-                                    "background:rgba(20,16,10,.92);color:#f0e0b0;padding:18px 26px;" +
-                                    "border:2px solid #b08a3a;border-radius:8px;font:16px sans-serif;" +
-                                    "z-index:1000;text-align:center;max-width:80%";
+                box.style.cssText =
+                    "position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);" +
+                    "background:rgba(20,16,10,.92);color:#f0e0b0;padding:18px 26px;" +
+                    "border:2px solid #b08a3a;border-radius:8px;font:16px sans-serif;" +
+                    "z-index:1000;text-align:center;max-width:80%";
                 box.textContent = code == 0 ? "The game has exited."
                                             : "The game stopped with error 0x" +
                                                   code.toString(16).toUpperCase() +
@@ -1663,8 +1664,15 @@ extern "C" EMSCRIPTEN_KEEPALIVE void recomp_web_start() {
 extern "C" EMSCRIPTEN_KEEPALIVE double *recomp_web_pacing() {
     static double out[11 + 120];
     const FramePacingSnapshot s = host_present_pacing();
-    const double head[] = {s.new_fps, s.display_fps, s.median_ms, s.p95_ms, s.gpu_ms, s.age_ms,
-                           s.repeat_percent, double(s.drops), double(mods_display_fps()),
+    const double head[] = {s.new_fps,
+                           s.display_fps,
+                           s.median_ms,
+                           s.p95_ms,
+                           s.gpu_ms,
+                           s.age_ms,
+                           s.repeat_percent,
+                           double(s.drops),
+                           double(mods_display_fps()),
                            double(mods_display_overlay())};
     for (int i = 0; i < 10; ++i)
         out[i] = head[i];
@@ -1777,6 +1785,8 @@ int web_main(int argc, char **argv) {
     D3DRenderer::setShared(renderer);
     host_present_set_device(g_gpu.get());
     host_present_set_fifo(RECOMP_PRESENT_FIFO != 0); // [present] fifo in game.toml
+    const char *deferred = recomp_env("DEFERRED_UPLOADS");
+    host_present_set_deferred_uploads(!deferred || strcmp(deferred, "0") != 0);
     mods_display_live_defaults();
     mods_display_default_overlay(platform_ui_default_overlay());
     mods_display_load_modes(classic_modes_path().c_str());

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Move browser audio mixing to a worker feeding an AudioWorklet, with an SDL
+  fallback selector. Add streamed-file cache progress, background fill controls,
+  launcher theme hooks and build metadata, and reduce repeated runtime logging.
+  Correct hook unwinding after guest callback returns.
+
+- Optimize web release linking as well as compilation, enable Wasm SIMD, and
+  expose opt-in LTO and heap/worker/stack settings without reducing defaults.
+  Package runtime symbol metadata without discovery fields; address hooks use
+  binary search and build the name index only when a mod requests names.
+
+- Stage browser CPU frames in their original pixel format until presentation.
+  Reuse the surface-upload shader for palette, RGB565 and XRGB conversion,
+  coalesce writes before seal, and retain per-frame pixel/palette ownership.
+  `RECOMP_DEFERRED_UPLOADS=0` selects the previous CPU upload path for comparison.
+  Browser presentation timing now follows recent animation-frame intervals.
+
+- Release the streamed-file cache mutex during foreground HTTP and chunk-file
+  reads. Reserve in-flight chunks to share concurrent requests and bound the
+  pending persistence queue to 32 MiB, with background backpressure and retries.
+  Add a Wasm/Node concurrency regression suite with a synthetic HTTP transport.
+
 - Allow native game adapters to place their own cursors at absolute touch
   positions in logical game pixels. Placement can discard pending DirectInput
   X/Y movement without losing button, wheel or keyboard input.

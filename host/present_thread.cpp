@@ -61,6 +61,7 @@ static std::atomic<bool> g_present_suspended{false};
 // Show every sealed frame once, oldest first, instead of only the newest
 // (host_present_set_fifo). Costs up to two frames of latency.
 std::atomic<bool> g_present_fifo{false};
+std::atomic<bool> g_deferred_uploads{false};
 // The performance overlay's placement and a page's hide button
 // (host_present_set_overlay_place).
 std::atomic<int> g_overlay_left{-1}, g_overlay_top{-1};
@@ -235,6 +236,8 @@ struct Service : std::enable_shared_from_this<Service> {
     HostScreenClass last_class = HOST_SCREEN_MENU;
     Metric metric;
     FramePacing pacing;
+    RefreshPeriod browser_refresh;
+    gpu::Pipeline packed_upload_pipeline;
     FILE *timings = nullptr;
     unsigned timing_rows = 0;
     FILE *ack_trace = nullptr;
@@ -502,7 +505,8 @@ struct Service : std::enable_shared_from_this<Service> {
             f->input.guest_h = guest_h;
         }
         f->input.ui = &f->ui;
-        if (!f->target->scene.w || (!fake && !f->supplied && !f->target->pixels)) {
+        if (!f->target->scene.w ||
+            (!fake && !f->supplied && !f->target->pixels && !f->target->upload_pending)) {
             drop(f);
             return;
         }
@@ -602,11 +606,8 @@ struct Service : std::enable_shared_from_this<Service> {
         if (!target)
             target = std::make_shared<Target>();
         target->device = fake ? nullptr : device;
-        const gpu::TextureDesc overlay_desc = !fake && target->scene.overlay
-                                                  ? device->describe(target->scene.overlay)
-                                                  : gpu::TextureDesc{};
         if (target->scene.w != w || target->scene.h != h ||
-            (!fake && (overlay_desc.width != gw || overlay_desc.height != gh))) {
+            (!fake && (target->overlay_w != gw || target->overlay_h != gh))) {
             target->release_scene();
             while (true) {
                 bool failed = fail_allocations > 0;
@@ -630,6 +631,8 @@ struct Service : std::enable_shared_from_this<Service> {
                         overlay = {fake_texture_ids++};
                     }
                     target->scene = {world, overlay, w, h};
+                    target->overlay_w = gw;
+                    target->overlay_h = gh;
                     break;
                 }
                 if (w == gw && h == gh) {
@@ -649,6 +652,7 @@ struct Service : std::enable_shared_from_this<Service> {
             }
         }
         targets[slot] = target;
+        target->upload_pending = false;
         writing = std::make_shared<Frame>();
         writing->target = target;
         return target->scene;
@@ -656,6 +660,86 @@ struct Service : std::enable_shared_from_this<Service> {
     void publish_layout(Frame &f) {
         f.layout = compositor_layout_snapshot(&f.input);
         f.layout.frame_id = f.frame_id;
+    }
+
+    // Packed uploads run on the presentation thread. Multiple producer writes
+    // before seal replace the CPU snapshot, so only the final image is
+    // transferred. The per-target buffer stays alive through GPU completion.
+    bool upload_staged(Frame &f, gpu::CommandBuffer cb) {
+        if (!f.target || !f.target->upload_pending)
+            return true;
+        auto &t = *f.target;
+        const int w = t.upload_w, h = t.upload_h;
+        if (!t.pixels || t.pixels_w != w || t.pixels_h != h ||
+            t.pixels_format != gpu::Format::RGBA8) {
+            if (t.pixels)
+                device->destroy(t.pixels);
+            t.pixels = texture(w, h);
+            t.pixels_w = w;
+            t.pixels_h = h;
+            t.pixels_format = gpu::Format::RGBA8;
+        }
+        if (!t.pixels)
+            return false;
+        if (t.upload_bpp == 0) {
+            if (!device->upload(t.pixels, {0, 0, w, h}, t.upload_pixels.data(), t.upload_pitch))
+                return false;
+        } else {
+            if (!packed_upload_pipeline) {
+                gpu::RenderState state;
+                state.color_format[0] = gpu::Format::RGBA8;
+                packed_upload_pipeline = device->render_pipeline("surface_upload", state);
+            }
+            if (!packed_upload_pipeline)
+                return false;
+            const size_t bytes = t.upload_pixels.size();
+            if (!t.upload_buffer || t.upload_capacity < bytes) {
+                if (t.upload_buffer)
+                    device->destroy(t.upload_buffer);
+                t.upload_buffer = device->create_buffer(bytes, t.upload_pixels.data());
+                t.upload_capacity = bytes;
+            } else {
+                device->update(t.upload_buffer, 0, t.upload_pixels.data(), bytes);
+            }
+            if (!t.upload_buffer)
+                return false;
+            const bool rgb565 = t.upload_bpp == 16;
+            const uint32_t p[20] = {uint32_t(w),
+                                    uint32_t(h),
+                                    uint32_t(w),
+                                    uint32_t(h),
+                                    uint32_t(t.upload_pitch),
+                                    uint32_t(t.upload_bpp),
+                                    uint32_t(t.upload_has_palette),
+                                    0,
+                                    rgb565 ? 0xf800u : 0xff0000u,
+                                    rgb565 ? 0x7e0u : 0xff00u,
+                                    rgb565 ? 0x1fu : 0xffu,
+                                    0,
+                                    rgb565 ? 11u : 16u,
+                                    rgb565 ? 5u : 8u,
+                                    0,
+                                    0,
+                                    rgb565 ? 31u : 255u,
+                                    rgb565 ? 63u : 255u,
+                                    rgb565 ? 31u : 255u,
+                                    0};
+            gpu::RenderPass pass;
+            pass.color[0].texture = t.pixels;
+            pass.color[0].load = gpu::Load::DontCare;
+            device->begin_render_pass(cb, pass);
+            device->set_pipeline(cb, packed_upload_pipeline);
+            device->set_buffer(cb, gpu::Stage::Fragment, 0, t.upload_buffer, 0);
+            device->set_bytes(cb, gpu::Stage::Fragment, 1, p, sizeof p);
+            device->set_bytes(cb, gpu::Stage::Fragment, 2, t.upload_palette.data(),
+                              sizeof t.upload_palette);
+            device->draw(cb, gpu::Primitive::Triangles, 0, 3);
+            device->end_render_pass(cb);
+        }
+        if (f.input.legacy)
+            f.input.legacy_frame = t.pixels;
+        t.upload_pending = false;
+        return true;
     }
 
     void tick(double ts) {
@@ -838,7 +922,9 @@ struct Service : std::enable_shared_from_this<Service> {
             std::shared_ptr<Composite> out =
                 reuse_composition ? cached : composite(w, h, out_format);
             gpu::CommandBuffer cb = device->begin();
-            if (!cb || !out) {
+            if (!cb || !out || !upload_staged(*f, cb)) {
+                if (cb)
+                    device->commit(cb);
                 if (drawable)
                     device->release_drawable(chain, drawable);
                 if (f) {
@@ -911,13 +997,11 @@ struct Service : std::enable_shared_from_this<Service> {
                     std::lock_guard published(g_pacing_published_mutex);
                     g_pacing_published = snapshot;
                 }
-                performance_overlay.draw(device, cb, drawable, drawable_desc.width,
-                                         drawable_desc.height, snapshot, ts,
-                                         g_overlay_hidden.load() || g_overlay_external.load()
-                                             ? 0
-                                             : mods_display_overlay(),
-                                         mods_display_fps(), g_overlay_left.load(),
-                                         g_overlay_top.load());
+                performance_overlay.draw(
+                    device, cb, drawable, drawable_desc.width, drawable_desc.height, snapshot, ts,
+                    g_overlay_hidden.load() || g_overlay_external.load() ? 0
+                                                                         : mods_display_overlay(),
+                    mods_display_fps(), g_overlay_left.load(), g_overlay_top.load());
                 const controls::ControlsView controls_view = host_present_controls();
                 if (controls_view.wanted)
                     controls_overlay.draw(device, cb, drawable, drawable_desc.width,
@@ -1138,6 +1222,7 @@ void host_present_pump(void) {
         std::lock_guard lock(s->mutex);
         if (s->stop)
             return;
+        s->frame_period = s->browser_refresh.observe(ts);
         s->last_link_tick = s->timestamp = ts;
         s->tick_pending = false;
     }
@@ -1311,6 +1396,8 @@ extern "C" int host_present_needs_legacy_pixels() {
     return 1;
 }
 extern "C" void host_present_stage_rgba(const uint8_t *rgba, int w, int h) {
+    if (host_present_stage_pixels(rgba, w, h, 0, nullptr, w * 4))
+        return;
     auto s = active.load();
     if (!s || !rgba || w <= 0 || h <= 0)
         return;
@@ -1338,6 +1425,57 @@ extern "C" void host_present_stage_rgba(const uint8_t *rgba, int w, int h) {
         if (t.pixels)
             s->device->upload(t.pixels, {0, 0, w, h}, rgba, w * 4);
     }
+}
+void host_present_set_deferred_uploads(bool enabled) {
+    g_deferred_uploads.store(enabled);
+}
+extern "C" int host_present_stage_pixels(const uint8_t *pixels, int w, int h, int bpp,
+                                         const uint32_t *palette, int pitch) {
+    if (!g_deferred_uploads.load())
+        return 0;
+    const int step = bpp == 8 ? 1 : bpp == 16 ? 2 : (bpp == 32 || bpp == 0) ? 4 : 0;
+    if (!pixels || !step || w <= 0 || h <= 0 || w > 4096 || h > 4096 || pitch < w * step)
+        return 0;
+    auto s = active.load();
+    if (!s)
+        return 0;
+    s->acquire(w, h, 0, 0);
+    std::lock_guard lock(s->mutex);
+    if (s->stop || !s->writing || !s->writing->target)
+        return 1; // a dropped frame must not fall back into synchronous GPU work
+    s->guest_w = w;
+    s->guest_h = h;
+    s->writing->staged_pixels = true;
+    auto &t = *s->writing->target;
+    const size_t row = size_t(w) * step, bytes = row * h;
+    t.upload_pixels.resize((bytes + 3) & ~size_t(3));
+    for (int y = 0; y < h; ++y)
+        memcpy(t.upload_pixels.data() + size_t(y) * row, pixels + size_t(y) * pitch, row);
+    std::fill(t.upload_pixels.begin() + bytes, t.upload_pixels.end(), 0);
+    t.upload_w = w;
+    t.upload_h = h;
+    t.upload_bpp = bpp;
+    t.upload_pitch = int(row);
+    t.upload_has_palette = palette != nullptr;
+    if (palette)
+        std::copy_n(palette, 256, t.upload_palette.begin());
+    t.upload_pending = true;
+    if (s->fake) {
+        t.test_pixels.resize(size_t(w) * h * 4);
+        if (bpp == 0)
+            t.test_pixels.assign(t.upload_pixels.begin(), t.upload_pixels.end());
+        else if (bpp == 8)
+            host_present_expand_indexed(t.upload_pixels.data(), w, h, int(row),
+                                        palette ? t.upload_palette.data() : nullptr,
+                                        t.test_pixels.data());
+        else if (bpp == 16)
+            host_present_expand_rgb565(t.upload_pixels.data(), w, h, int(row),
+                                       t.test_pixels.data());
+        else
+            host_present_expand_xrgb8888(t.upload_pixels.data(), w, h, int(row),
+                                         t.test_pixels.data());
+    }
+    return 1;
 }
 // Whether a real device is presenting, so a guest-side GPU path has a queue to
 // put its work on and a frame to stage it into.
@@ -1372,6 +1510,7 @@ bool host_present_stage_texture(gpu::Texture src, int w, int h, int guest_w, int
     }
     if (!t.pixels)
         return false;
+    t.upload_pending = false; // a GPU-staged image supersedes any earlier CPU snapshot
     // Supersampled pixels do not enlarge the guest's client area. Publishing
     // their dimensions here sends touches beyond that area and hides cursors.
     s->guest_w = guest_w;

@@ -41,10 +41,6 @@ std::map<std::string, uint32_t> &names() {
     static std::map<std::string, uint32_t> m;
     return m;
 }
-std::map<uint32_t, size_t> &by_addr() {
-    static std::map<uint32_t, size_t> m;
-    return m;
-}
 std::map<std::string, Global> &globals() {
     static std::map<std::string, Global> m;
     return m;
@@ -54,6 +50,30 @@ std::map<std::string, uint32_t> &events() {
     return m;
 }
 std::string g_sha, g_error;
+std::vector<std::pair<std::string, uint32_t>> g_aliases;
+bool g_names_ready = false;
+
+// Address-based hooks need only the sorted symbol vector. Building hundreds
+// of thousands of tree nodes at boot was wasted for games whose mods never
+// ask for names. Name lookup retains the same primary/alias/global precedence.
+void ensure_names() {
+    if (g_names_ready)
+        return;
+    for (const auto &s : syms())
+        names()[s.name] = s.addr;
+    for (const auto &a : g_aliases)
+        names().try_emplace(a.first, a.second);
+    for (const auto &kv : globals())
+        names().try_emplace(kv.first, kv.second.addr);
+    g_names_ready = true;
+}
+
+const Sym *find_address(uint32_t addr) {
+    const auto &v = syms();
+    auto it = std::lower_bound(v.begin(), v.end(), addr,
+                               [](const Sym &s, uint32_t a) { return s.addr < a; });
+    return it != v.end() && it->addr == addr ? &*it : nullptr;
+}
 
 struct P {
     const char *p;
@@ -291,19 +311,10 @@ bool mods_symbols_load(const char *path) {
     std::sort(syms().begin(), syms().end(),
               [](const Sym &a, const Sym &b) { return a.addr < b.addr; });
     names().clear();
-    by_addr().clear();
-    for (size_t i = 0; i < syms().size(); ++i) {
-        names()[syms()[i].name] = syms()[i].addr; // functions.tsv name is primary
-        by_addr()[syms()[i].addr] = i;
-    }
-    for (const auto &a : aliases)
-        if (!names().count(a.first))
-            names()[a.first] = a.second; // secondary
-    globals() = new_globals;
-    events() = new_events;
-    for (const auto &kv : globals())
-        if (!names().count(kv.first))
-            names()[kv.first] = kv.second.addr;
+    g_names_ready = false;
+    g_aliases = std::move(aliases);
+    globals() = std::move(new_globals);
+    events() = std::move(new_events);
     g_sha = sha;
     g_error.clear();
     return true;
@@ -312,6 +323,7 @@ bool mods_symbols_load(const char *path) {
 PopModStatus mods_symbol(const char *name, uint32_t *out_addr) {
     if (!name || !out_addr)
         return POP_E_INVAL;
+    ensure_names();
     auto it = names().find(name);
     if (it == names().end())
         return POP_E_NOSYMBOL;
@@ -323,6 +335,7 @@ PopModStatus mods_symbols_matching(const char *prefix, uint32_t *out, uint32_t c
                                    uint32_t *out_count) {
     if (!prefix || !out_count)
         return POP_E_INVAL;
+    ensure_names();
     size_t n = strlen(prefix);
     std::vector<uint32_t> hits;
     for (const auto &kv : names())
@@ -337,13 +350,13 @@ PopModStatus mods_symbols_matching(const char *prefix, uint32_t *out, uint32_t c
 }
 
 bool mods_symbol_hookable(uint32_t addr) {
-    auto it = by_addr().find(addr);
-    return it != by_addr().end() && syms()[it->second].hookable;
+    const auto *s = find_address(addr);
+    return s && s->hookable;
 }
 
 const char *mods_symbol_kind(uint32_t addr) {
-    auto it = by_addr().find(addr);
-    return it == by_addr().end() ? "" : syms()[it->second].kind.c_str();
+    const auto *s = find_address(addr);
+    return s ? s->kind.c_str() : "";
 }
 
 uint32_t mods_symbol_global(const char *name) {

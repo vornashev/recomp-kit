@@ -270,7 +270,13 @@ if(TARGET recomp_gen)
     file(MAKE_DIRECTORY ${web_resources})
     file(COPY ${POP_ROOT}/tools/recomp/baseline/classic-modes.json DESTINATION ${web_resources})
     if(EXISTS ${POP_BUILD_ROOT}/recomp/symbols.json)
-      file(COPY ${POP_BUILD_ROOT}/recomp/symbols.json DESTINATION ${web_resources})
+      # Keep all mod-visible symbols and eligibility, without the translator's
+      # development-only provenance/index/evidence or pretty-print whitespace.
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        ${POP_BUILD_ROOT}/recomp/symbols.json ${POP_ROOT}/tools/compact_symbols.py)
+      execute_process(COMMAND ${Python3_EXECUTABLE} ${POP_ROOT}/tools/compact_symbols.py
+        ${POP_BUILD_ROOT}/recomp/symbols.json ${web_resources}/symbols.json
+        COMMAND_ERROR_IS_FATAL ANY)
     endif()
     if(EXISTS ${RECOMP_GAME_DIR}/mods/core)
       file(COPY ${RECOMP_GAME_DIR}/mods/core DESTINATION ${web_resources}/mods FILES_MATCHING PATTERN "*.toml"
@@ -298,13 +304,21 @@ if(TARGET recomp_gen)
     target_sources(recomp_app PRIVATE ${HOST}/sdl/web_remote_fs.cpp)
     set_source_files_properties(${HOST}/sdl/web_remote_fs.cpp PROPERTIES
       INCLUDE_DIRECTORIES ${EMSCRIPTEN_ROOT_PATH}/system/lib/wasmfs)
+    # Keep the established defaults until a game's worst-case heap/stack and
+    # simultaneous thread counts have been measured. These cache settings let
+    # the same build pipeline produce smaller comparison builds safely.
+    set(RECOMP_WEB_INITIAL_MEMORY 1073741824 CACHE STRING "Initial Wasm memory in bytes")
+    set(RECOMP_WEB_MAXIMUM_MEMORY 4294967296 CACHE STRING "Maximum Wasm memory in bytes")
+    set(RECOMP_WEB_PTHREAD_POOL_SIZE 24 CACHE STRING "Prestarted browser workers")
+    set(RECOMP_WEB_PTHREAD_STACK_SIZE 16777216 CACHE STRING "Default pthread stack bytes")
     target_link_options(recomp_app PRIVATE
-      -pthread -sPTHREAD_POOL_SIZE=24 -sWASMFS
-      -sINITIAL_MEMORY=1073741824 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296
+      -pthread -sPTHREAD_POOL_SIZE=${RECOMP_WEB_PTHREAD_POOL_SIZE} -sWASMFS
+      -sINITIAL_MEMORY=${RECOMP_WEB_INITIAL_MEMORY} -sALLOW_MEMORY_GROWTH=1
+      -sMAXIMUM_MEMORY=${RECOMP_WEB_MAXIMUM_MEMORY}
       # Not -sGROWABLE_ARRAYBUFFERS: it would save the check for a grown heap on
       # each JS access, but a view of a growable buffer is refused by
       # FileSystemSyncAccessHandle.write, and every write to OPFS then fails.
-      -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=16777216
+      -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=${RECOMP_WEB_PTHREAD_STACK_SIZE}
       -sENVIRONMENT=web,worker -sEXIT_RUNTIME=0 -sINVOKE_RUN=0
       -sEXPORTED_RUNTIME_METHODS=ENV,callMain,FS,HEAPF64
       --preload-file ${web_resources}@/app/resources)
@@ -336,6 +350,20 @@ endif()
 # no audio device. Labelled `gpu`: the renderer tests need a device.
 # report_lock.cpp is a source here rather than host_common, because the script
 # never linked boot.cpp into this suite.
+if(EMSCRIPTEN)
+  # The production WasmFS cache, with a deterministic in-memory HTTP transport.
+  # Node workers exercise the same locks and pending queue without game assets.
+  add_executable(web_remote_fs_tests tests/web_remote_fs_tests.cpp)
+  target_include_directories(web_remote_fs_tests PRIVATE ${EMSCRIPTEN_ROOT_PATH}/system/lib/wasmfs)
+  target_link_options(web_remote_fs_tests PRIVATE
+    -pthread -sWASMFS -sENVIRONMENT=node,worker -sPROXY_TO_PTHREAD
+    -sPTHREAD_POOL_SIZE=4 -sEXIT_RUNTIME=1 -sINITIAL_MEMORY=268435456 -sALLOW_MEMORY_GROWTH)
+  pop_optimize(web_remote_fs_tests 2)
+  pop_test_binary(web_remote_fs_tests)
+  add_test(NAME web_remote_fs_tests COMMAND web_remote_fs_tests)
+  set_tests_properties(web_remote_fs_tests PROPERTIES LABELS nogame TIMEOUT 30)
+endif()
+
 if(NOT IOS AND NOT ANDROID)
 pop_host(host_tests UI_LAYER
   SOURCES ${HOST}/tests/host_tests.cpp ${HOST}/tests/test_frame_builder.cpp

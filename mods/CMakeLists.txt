@@ -38,6 +38,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(NOT IOS AND NOT ANDROID)
+add_executable(symbols_tests symbols.cpp tests/symbols_tests.cpp)
+target_include_directories(symbols_tests PRIVATE ${POP_ROOT} ${POP_ROOT}/runtime ${POP_ROOT}/third_party/lua)
+target_link_libraries(symbols_tests PRIVATE recomp_platform)
+pop_optimize(symbols_tests 2)
+pop_test_binary(symbols_tests)
+add_test(NAME symbols_tests COMMAND symbols_tests WORKING_DIRECTORY ${POP_ROOT})
+set_tests_properties(symbols_tests PROPERTIES LABELS nogame)
+
 add_library(recomp_mods_testing OBJECT ${POP_MODS_SOURCES})
 target_include_directories(recomp_mods_testing PUBLIC ${POP_ROOT} ${POP_ROOT}/runtime)
 target_link_libraries(recomp_mods_testing PUBLIC lua recomp_runtime_testing recomp_builtin_defaults)
@@ -100,8 +108,10 @@ if(TARGET recomp_gen AND NOT IOS AND NOT ANDROID)
   pop_optimize(mods_api_header_test 1)
 
   file(GLOB POP_MODS_TEST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
-  # layout_tests is its own nogame executable with its own main.
-  list(REMOVE_ITEM POP_MODS_TEST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/layout_tests.cpp)
+  # These nogame executables each provide their own main and loader stubs.
+  list(REMOVE_ITEM POP_MODS_TEST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/layout_tests.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/symbols_tests.cpp)
   # game_view_tests decodes the game's entity records with the game's own codec.
   if(NOT EXISTS ${RECOMP_GAME_DIR}/tests/entity_codec.hpp)
     list(REMOVE_ITEM POP_MODS_TEST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/tests/game_view_tests.cpp)

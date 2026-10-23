@@ -9,6 +9,7 @@
 #include "ui_layer.h"
 
 #include <memory>
+#include <array>
 #include <vector>
 
 struct Fence {
@@ -30,8 +31,17 @@ struct Target {
     HostSceneTarget scene;
     gpu::Texture pixels;
     int pixels_w = 0, pixels_h = 0;
+    int overlay_w = 0, overlay_h = 0;
     gpu::Format pixels_format = gpu::Format::RGBA8;
     std::vector<uint8_t> test_pixels;
+    // A producer-owned copy until seal, then immutable until the presenter
+    // has uploaded it. Reused only after this target's GPU leases retire.
+    std::vector<uint8_t> upload_pixels;
+    std::array<uint32_t, 256> upload_palette{};
+    int upload_w = 0, upload_h = 0, upload_bpp = 0, upload_pitch = 0;
+    bool upload_pending = false, upload_has_palette = false;
+    gpu::Buffer upload_buffer;
+    size_t upload_capacity = 0;
     void release_scene() {
         if (device) {
             if (scene.world)
@@ -45,6 +55,8 @@ struct Target {
         release_scene();
         if (device && pixels)
             device->destroy(pixels);
+        if (device && upload_buffer)
+            device->destroy(upload_buffer);
     }
 };
 struct Frame {

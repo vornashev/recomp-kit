@@ -1127,8 +1127,8 @@ void WebGpuDevice::destroy(Swapchain s) {
 }
 
 double WebGpuDevice::now_seconds() {
-    if (off_main())
-        return on_main([&] { return now_seconds(); });
+    // Emscripten aligns worker clocks with the main runtime. Reading the
+    // clock uses no WebGPU object and must not synchronously proxy a seal.
     return emscripten_get_now() / 1000.0;
 }
 

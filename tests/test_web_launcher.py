@@ -44,11 +44,21 @@ class WebLauncherTests(unittest.TestCase):
             build.mkdir()
             with self.assertRaises(ValueError):
                 web_launcher.copy_web_build("stub", build, tmp / "site")
-            for name in ("index.html", "App.js", "App.wasm", "App.data", "libgen.a"):
+            for name in ("index.html", "App.js", "App.data", "libgen.a"):
                 (build / name).write_text(name)
+            # A minimal valid module also works when llvm-objcopy is installed.
+            (build / "App.wasm").write_bytes(b"\0asm\x01\0\0\0")
             web_launcher.copy_web_build("stub", build, tmp / "site")
-            copied = sorted(f.name for f in (tmp / "site/stub").iterdir())
-            self.assertEqual(copied, ["App.data", "App.js", "App.wasm", "index.html"])
+            dest = tmp / "site/stub"
+            copied = {f.name for f in dest.iterdir()}
+            expected = {"App.data", "App.js", "App.wasm", "index.html", "build.json"}
+            expected.update("App." + suffix + ".gz" for suffix in ("data", "js", "wasm"))
+            if shutil.which("brotli"):
+                expected.update("App." + suffix + ".br" for suffix in ("data", "js", "wasm"))
+            self.assertEqual(copied, expected)
+            metadata = json.loads((dest / "build.json").read_text())
+            self.assertEqual(metadata["wasmBytes"], (dest / "App.wasm").stat().st_size)
+            self.assertEqual(metadata["dataBytes"], (dest / "App.data").stat().st_size)
     def test_core_suite(self):
         node = shutil.which("node")
         if not node:

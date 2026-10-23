@@ -283,6 +283,11 @@ void host_present_set_overlay_external(bool external);
 void host_frame_seal(void);
 void host_present_first_write(void);
 void host_present_stage_rgba(const uint8_t *rgba, int w, int h);
+// Web-style presentation: snapshot pixels on the producer, upload once on
+// the presenter. The default remains immediate for other hosts.
+void host_present_set_deferred_uploads(bool enabled);
+int host_present_stage_pixels(const uint8_t *pixels, int w, int h, int bpp, const uint32_t *palette,
+                              int pitch);
 // Includes bounded command-completion recovery; faults reports that degraded
 // path. Only drawable acknowledgements enter the windowed continuous metric.
 uint64_t host_present_unique_completed(void);
