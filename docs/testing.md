@@ -61,6 +61,13 @@ instruction or table shape it does not handle.
 The differential harness compares translated routines with original instructions
 under Unicorn. Unicorn is a development tool, not part of the playable app.
 
+## Web page checks
+
+Run `node --test web/launcher/tests/*.test.mjs web/player/tests/*.test.mjs`
+from the kit root. These cover import rules and panel selection, including a
+save read finishing after its panel closes and themed FPS with the native
+overlay disabled. They do not render the page or run the game.
+
 ## Web cache checks
 
 The web cache also has a synthetic Wasm/Node suite. With the Emscripten SDK

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep themed browser FPS controls available when the native overlay is off.
+  Share top-panel selection between FPS, saves and theme panels, so switching
+  tabs closes the others even while a save list is still loading.
+
 - Move browser audio mixing to a worker feeding an AudioWorklet, with an SDL
   fallback selector. Add streamed-file cache progress, background fill controls,
   launcher theme hooks and build metadata, and reduce repeated runtime logging.

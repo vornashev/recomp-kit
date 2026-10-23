@@ -50,7 +50,9 @@
        onPacing(pacing)        the frame statistics, every quarter second while
                                running; having it hands the overlay to the theme
        onExit(code, exited)    the game ended (called by the engine)
-     and use window.recompPlayer (setFill, persist, clearCache, downloadLog). -->
+       onPanel(name)          the active top panel changed (null when all closed)
+     and use window.recompPlayer (setFill, persist, clearCache, downloadLog,
+     registerPanel(name, setOpen), setPanel(name), togglePanel(name)). -->
 @THEME_HEAD@
 </head>
 <body>
@@ -150,12 +152,32 @@ function pollStream(m) {
   return st;
 }
 
+// One owner for top-panel visibility, including panels supplied by a theme.
+// Select synchronously: an async storage read must never reopen a closed panel.
+const panels = new Map();
+let activePanel = null;
+
 // For a theme: the things a player can ask of the page.
 const player = window.recompPlayer = {
   log,
   state: loaderState,
   module: null,
   gameId: "",
+  registerPanel(name, setOpen) {
+    panels.set(name, setOpen);
+    setOpen(activePanel === name);
+  },
+  setPanel(name) {
+    if (name !== null && !panels.has(name)) return;
+    activePanel = name;
+    for (const [id, setOpen] of panels) setOpen(id === name);
+    call("onPanel", name);
+  },
+  togglePanel(name) {
+    const open = activePanel !== name;
+    player.setPanel(open ? name : null);
+    return open;
+  },
   // 0 off, 1 in the game's quiet moments, 2 now; 0 and 1 are remembered.
   setFill(mode) {
     if (mode !== 2) try { localStorage.setItem(`recomp.fill.${player.gameId}`, String(mode)); } catch {}
@@ -410,21 +432,26 @@ function setupPerfButton(m) {
   if (!m._recomp_web_overlay_hidden || !m._recomp_web_overlay_mode) return;
   let hidden = false;
   try { hidden = localStorage.getItem("recomp.perf.hidden") === "1"; } catch {}
-  const apply = () => {
-    m._recomp_web_overlay_hidden(hidden ? 1 : 0);
-    player.overlayHidden = hidden;
-    button.textContent = hidden ? "▸ FPS" : "▾ FPS";
-    button.setAttribute("aria-expanded", String(!hidden));
-  };
+  const external = !!(UI.onPacing && m._recomp_web_pacing);
+  if (external) m._recomp_web_overlay_external?.(1);
+  player.registerPanel("perf", (open) => {
+    m._recomp_web_overlay_hidden(open ? 0 : 1);
+    player.overlayHidden = !open;
+    button.textContent = open ? "▾ FPS" : "▸ FPS";
+    button.setAttribute("aria-expanded", String(open));
+    button.setAttribute("aria-pressed", String(open));
+    try { localStorage.setItem("recomp.perf.hidden", open ? "0" : "1"); } catch {}
+  });
   button.addEventListener("click", () => {
-    hidden = !hidden;
-    try { localStorage.setItem("recomp.perf.hidden", hidden ? "1" : "0"); } catch {}
-    apply();
+    player.togglePanel("perf");
     canvas.focus();
   });
-  apply();
-  // Only while the overlay is switched on in the settings.
-  const sync = () => { button.hidden = !m._recomp_web_overlay_mode(); };
+  if (!hidden && (external || m._recomp_web_overlay_mode())) player.setPanel("perf");
+  // A theme draws its own statistics even when the native overlay is disabled.
+  const sync = () => {
+    button.hidden = !external && !m._recomp_web_overlay_mode();
+    if (button.hidden && activePanel === "perf") player.setPanel(null);
+  };
   sync();
   setInterval(sync, 1000);
 }
@@ -460,9 +487,16 @@ function setupSaves(id, game) {
   const panel = document.getElementById("saves");
   button.textContent = T.button;
   button.hidden = false;
+  button.setAttribute("aria-controls", "saves");
+  player.registerPanel("saves", (open) => {
+    panel.hidden = !open;
+    button.setAttribute("aria-expanded", String(open));
+    button.setAttribute("aria-pressed", String(open));
+  });
   const ext = (game.saveExt || "").toLowerCase();
+  let renderVersion = 0;
   const render = async () => {
-    panel.replaceChildren();
+    const version = ++renderVersion;
     const h2 = document.createElement("h2");
     h2.textContent = T.title;
     const list = document.createElement("ul");
@@ -525,15 +559,14 @@ function setupSaves(id, game) {
     note.textContent = T.note;
     const persist = document.createElement("p");
     persist.textContent = (await navigator.storage.persisted?.()) ? T.persisted : T.notPersisted;
-    panel.append(h2, list, upload, note, persist);
+    if (version === renderVersion) panel.replaceChildren(h2, list, upload, note, persist);
   };
   button.addEventListener("click", async () => {
-    if (panel.hidden) {
+    if (player.togglePanel("saves")) {
+      if (!panel.hasChildNodes()) panel.textContent = T.title;
       await navigator.storage.persist?.().catch(() => {});
       await render();
-    }
-    panel.hidden = !panel.hidden;
-    if (panel.hidden) canvas.focus();
+    } else canvas.focus();
   });
 }
 
