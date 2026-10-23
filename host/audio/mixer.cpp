@@ -403,6 +403,20 @@ void ensure_running() {
         return;
     if (g_sink && g_sink->running())
         return;
+#ifdef __EMSCRIPTEN__
+    // The worklet keeps the mix off the page's main thread; RECOMP_AUDIO_SINK=sdl
+    // goes back to SDL's ScriptProcessorNode for comparison.
+    if (!g_sink) {
+        const char *which = recomp_env("AUDIO_SINK");
+        if (!which || strcmp(which, "sdl") != 0) {
+            g_sink = make_web_sink();
+            if (!g_sink->start(g_render_rate, render_block))
+                g_sink.reset();
+        }
+    }
+    if (g_sink && g_sink->running())
+        return;
+#endif
     if (!g_sink)
         g_sink = make_sdl_sink();
     if (!g_sink->start(g_render_rate, render_block)) {

@@ -277,6 +277,9 @@ void host_present_set_fifo(bool fifo);
 // Where the performance overlay sits (drawable pixels; a negative `left` is
 // the default top-right corner) and whether a page has hidden it.
 void host_present_set_overlay_place(int left, int top, bool hidden);
+// A page that shows the frame statistics its own way: the overlay is not drawn,
+// and host_present_pacing returns the numbers it would have shown.
+void host_present_set_overlay_external(bool external);
 void host_frame_seal(void);
 void host_present_first_write(void);
 void host_present_stage_rgba(const uint8_t *rgba, int w, int h);
@@ -306,6 +309,10 @@ void host_present_tick_for_test(double ts);
 #include "controls/overlay.h"
 void host_present_set_controls(const controls::ControlsView &view);
 controls::ControlsView host_present_controls(void);
+// The frame statistics last drawn, or that would have been drawn while the
+// overlay is external (host_present_set_overlay_external).
+#include "frame_pacing.h"
+FramePacingSnapshot host_present_pacing(void);
 #endif
 
 #ifdef __cplusplus

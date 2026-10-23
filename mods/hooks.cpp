@@ -403,9 +403,12 @@ static void mods_hook_dispatch(X86 *c, uint32_t index) {
     mods_hooks_unwind_to_esp(c->r[R_ESP]);
     if (t_stack.depth >= MODS_MAX_DEPTH) {
         // Deeper recursion than the foundation tracks: run the original so the
-        // guest is never left mid-call, and say so once.
-        LOGW("mods: hook recursion deeper than %d at %08x; running the original", MODS_MAX_DEPTH,
-             recomp_func_addrs[index]);
+        // guest is never left mid-call, and say so once per function: a hot
+        // one (a window procedure) would otherwise log on every call.
+        char key[48];
+        snprintf(key, sizeof key, "mods-hook-depth:%08x", recomp_func_addrs[index]);
+        log_once(key, "mods: hook recursion deeper than %d at %08x; running the original",
+                 MODS_MAX_DEPTH, recomp_func_addrs[index]);
         recomp_base_ptrs[index](c);
         return;
     }

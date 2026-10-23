@@ -27,6 +27,11 @@ FetchContent_Declare(SDL3
   GIT_TAG release-3.4.16
   GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(SDL3)
+# The top level sets the Release flags to -g alone and optimizes per target
+# (cmake/Warnings.cmake), which a fetched project never opts into: SDL was
+# built at -O0. On the web that is the audio stream's conversion and
+# resampling, run on the browser's main thread for every audio period.
+pop_optimize(SDL3-static 2)
 
 # glslang compiles the Direct3D 9 renderer's GLSL to SPIR-V at run time
 # (host/gpu/vulkan/d3d9_vulkan.cpp): every platform that renders on Vulkan.
@@ -46,6 +51,12 @@ if(NOT IOS AND NOT EMSCRIPTEN)
     GIT_TAG 16.6.0
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(glslang)
+  # Unoptimized for the same reason as SDL above; it compiles every shader.
+  foreach(lib glslang SPIRV MachineIndependent GenericCodeGen OSDependent glslang-default-resource-limits)
+    if(TARGET ${lib})
+      pop_optimize(${lib} 2)
+    endif()
+  endforeach()
 endif()
 
 # pop_link_sdl(<target>): link SDL3 statically and give the target its headers.

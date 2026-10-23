@@ -32,6 +32,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -81,9 +82,21 @@ def copy_web_build(game_id, build, out):
     for f in build.iterdir():
         if f.is_file() and (f.name == "index.html" or f.suffix in WEB_BUILD_SUFFIXES):
             shutil.copy2(f, dest / f.name)
+    # The game's page theme (host/CMakeLists.txt), whole.
+    if (build / "theme").is_dir():
+        shutil.rmtree(dest / "theme", ignore_errors=True)
+        shutil.copytree(build / "theme", dest / "theme")
     for wasm in dest.glob("*.wasm"):
         strip_debug(wasm)
     compress_web_build(dest)
+    # What the page's loader measures progress against: the engine's size as
+    # the browser decodes it (the server sends it compressed), and when it was
+    # built, which the crash dialog quotes.
+    sizes = {f.suffix[1:] + "Bytes": f.stat().st_size for f in dest.iterdir()
+             if f.is_file() and f.suffix in (".wasm", ".data")}
+    wasm = next(dest.glob("*.wasm"), None)
+    built = time.strftime("%Y-%m-%d %H:%M", time.localtime(wasm.stat().st_mtime)) if wasm else ""
+    (dest / "build.json").write_text(json.dumps({**sizes, "built": built}) + "\n")
 
 
 def strip_debug(wasm):

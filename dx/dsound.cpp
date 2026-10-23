@@ -443,19 +443,23 @@ float pcm_peak(uint32_t addr, uint32_t bytes, uint32_t bits) {
 }
 
 // Buffers that have already announced themselves. One line per buffer, on its
-// first Play, so a live run says what it handed the host without a per-refill
-// flood.
+// first Play, so a run says what it handed the host without a per-refill
+// flood. Verbose only (RECOMP_LOG=2): a game that makes a buffer per sound
+// effect, as Heroes IV does, would otherwise log every sound it plays and scan
+// each one's PCM for the peak.
 std::vector<uint32_t> &announced() {
     static auto *v = new std::vector<uint32_t>();
     return *v;
 }
 
 void announce_once(const ComObj *b, uint32_t from) {
+    if (log_level() < 2)
+        return;
     for (uint32_t id : announced())
         if (id == b->id)
             return;
     announced().push_back(b->id);
-    LOGW("dsound: buffer %u first play on channel %d: %u Hz, %u ch, %u bit, "
+    LOGV("dsound: buffer %u first play on channel %d: %u Hz, %u ch, %u bit, "
          "%u bytes from %u, %s, peak %.3f",
          b->id, b->channel, b->frequency ? b->frequency : b->rate, b->nchannels, b->bits,
          b->buf_bytes, from, b->looping ? "looping" : "one-shot",

@@ -3697,17 +3697,22 @@ std::string msvc_thrown_type(uint32_t info) {
 }
 
 void k_RaiseException(X86 *c) {
-    if (arg(c, 0) == 0xe06d7363u && arg(c, 2) >= 3 && gm_valid(arg(c, 3), 12))
-    {
+    // Once per type and throw site: a game that throws in normal play (Heroes
+    // IV does, several times a screen) would otherwise log and walk the stack
+    // on every throw, and on the web every line crosses to the page.
+    if (arg(c, 0) == 0xe06d7363u && arg(c, 2) >= 3 && gm_valid(arg(c, 3), 12)) {
+        const std::string type = msvc_thrown_type(rd32(arg(c, 3) + 8));
+        char key[300];
+        snprintf(key, sizeof key, "cxx-throw:%s@%08x", type.c_str(), rd32(c->r[R_ESP]));
         std::string frames;
-        for (uint32_t r : win32_return_chain(c->r[R_EBP], 10)) {
-            char b[16];
-            snprintf(b, sizeof b, " %08x", r);
-            frames += b;
-        }
-        LOGW("C++ exception %s thrown (object %08x) from ret=%08x, frames:%s",
-             msvc_thrown_type(rd32(arg(c, 3) + 8)).c_str(), rd32(arg(c, 3) + 4),
-             rd32(c->r[R_ESP]), frames.c_str());
+        if (log_level() >= 1)
+            for (uint32_t r : win32_return_chain(c->r[R_EBP], 10)) {
+                char b[16];
+                snprintf(b, sizeof b, " %08x", r);
+                frames += b;
+            }
+        log_once(key, "C++ exception %s thrown (object %08x) from ret=%08x, frames:%s",
+                 type.c_str(), rd32(arg(c, 3) + 4), rd32(c->r[R_ESP]), frames.c_str());
     }
     // A raise the guest goes on to handle is invisible in a run log otherwise,
     // and the frames it climbed out of are exactly what a language exception

@@ -37,6 +37,21 @@
            border-radius: 5px; padding: 3px 8px; font: inherit; font-size: 12px; cursor: pointer; }
   #saves label input { display: none; }
 </style>
+<!-- A game's theme, when it has one (host/CMakeLists.txt). It may set
+     window.recompUI before the page starts:
+       onProgress(state)       while loading: state.stage is link, engine, compile,
+                               archives, ready or running; see loaderState below
+       onProblem(kind, detail) unsupported {checks}, portal {retry}, tab {takeOver},
+                               fatal {message}
+       onReady({start})        the game is loaded and waits: call start() from a
+                               click, which lets the browser play sound
+       onRunning()             the game has started
+       onStream(stats)         every quarter second while running
+       onPacing(pacing)        the frame statistics, every quarter second while
+                               running; having it hands the overlay to the theme
+       onExit(code, exited)    the game ended (called by the engine)
+     and use window.recompPlayer (setFill, persist, clearCache, downloadLog). -->
+@THEME_HEAD@
 </head>
 <body>
 <canvas id="canvas" tabindex="-1"></canvas>
@@ -60,6 +75,163 @@ function status(text, back) {
 }
 const log = [];
 window.recompLog = log; // for tests
+const UI = window.recompUI || {};
+const call = (name, ...args) => { try { return UI[name]?.(...args); } catch (e) { console.error(e); } };
+
+// What a theme draws the loader from. Bytes are as the browser decodes them.
+const loaderState = {
+  stage: "link",
+  streamed: false,
+  engine: { loaded: 0, total: 0 },  // the .wasm
+  compileSince: 0,                  // performance.now() when compiling began
+  stream: null,                     // web_remote_fs.cpp's counters, once running
+  starting: false,                  // the start button was pressed; the first frame is coming
+  waitingMs: 0,                     // how long the game has waited on the network
+  lastProgress: performance.now(),  // when any byte last arrived
+  build: {},                        // build.json: sizes and when it was built
+};
+let progressQueued = false;
+function progress() {
+  if (progressQueued) return;
+  progressQueued = true;
+  requestAnimationFrame(() => { progressQueued = false; call("onProgress", loaderState); });
+}
+function setStage(stage) {
+  if (loaderState.stage === stage) return;
+  loaderState.stage = stage;
+  progress();
+}
+
+// Counts the engine's bytes as they arrive: the engine keeps the original
+// response (so the browser still compiles it while streaming and caches the
+// compiled code), the count reads a clone.
+const pageFetch = window.fetch;
+window.fetch = function (input, init) {
+  const url = typeof input === "string" ? input : input?.url || String(input);
+  const p = pageFetch.apply(this, arguments);
+  if (!/\.wasm(\?|$)/.test(url)) return p;
+  return p.then((r) => {
+    if (!r.ok || !r.body) return r;
+    try {
+      const reader = r.clone().body.getReader();
+      const pump = () => reader.read().then(({ done, value }) => {
+        if (done) { loaderState.compileSince = performance.now(); setStage("compile"); return; }
+        loaderState.engine.loaded += value.byteLength;
+        loaderState.lastProgress = performance.now();
+        progress();
+        pump();
+      }, () => {});
+      pump();
+    } catch {}
+    return r;
+  });
+};
+
+// The stream's counters (recomp_web_stream_stats), by slot.
+const STREAM_SLOTS = ["mounted", "packTotal", "packDone", "hotTotal", "hotDone", "gameTotal", "kept",
+                      "keptKnown", "fetched", "waitSince", "waitBytes", "fillMode", "fillDone"];
+function readStream(m) {
+  if (!m._recomp_web_stream_stats || !m.HEAPF64) return null;
+  const at = m._recomp_web_stream_stats() >> 3;
+  const out = {};
+  STREAM_SLOTS.forEach((k, i) => { out[k] = m.HEAPF64[at + i]; });
+  return out;
+}
+let waitSeen = 0, lastFetched = 0;
+function pollStream(m) {
+  const st = readStream(m);
+  if (!st) return null;
+  // The engine stamps the wait with its own thread's clock; the page times it.
+  const now = performance.now();
+  if (st.waitSince) { if (!waitSeen) waitSeen = now; } else waitSeen = 0;
+  loaderState.waitingMs = waitSeen ? now - waitSeen : 0;
+  if (st.fetched !== lastFetched) { lastFetched = st.fetched; loaderState.lastProgress = now; }
+  loaderState.stream = st;
+  return st;
+}
+
+// For a theme: the things a player can ask of the page.
+const player = window.recompPlayer = {
+  log,
+  state: loaderState,
+  module: null,
+  gameId: "",
+  // 0 off, 1 in the game's quiet moments, 2 now; 0 and 1 are remembered.
+  setFill(mode) {
+    if (mode !== 2) try { localStorage.setItem(`recomp.fill.${player.gameId}`, String(mode)); } catch {}
+    player.module?._recomp_web_stream_fill?.(mode);
+  },
+  fillPreference() {
+    let v = null;
+    try { v = localStorage.getItem(`recomp.fill.${player.gameId}`); } catch {}
+    if (v !== null) return Number(v);
+    // Not on a metered connection unless asked.
+    const c = navigator.connection;
+    return c && (c.saveData || c.type === "cellular") ? 0 : 1;
+  },
+  async persisted() { return !!(await navigator.storage.persisted?.()); },
+  async persist() { return !!(await navigator.storage.persist?.().catch(() => false)); },
+  async storage() { return (await navigator.storage.estimate?.()) || {}; },
+  // The streamed copy goes on the next load: nothing may hold it while the game runs.
+  clearCache() {
+    try { localStorage.setItem(`recomp.clear.${player.gameId}`, "1"); } catch {}
+    location.reload();
+  },
+  downloadLog() {
+    const head = [`${document.title} — ${location.href}`, `built ${loaderState.build.built || "?"}`,
+                  navigator.userAgent, new Date().toString(), ""];
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([head.concat(log).join("\n")], { type: "text/plain" }));
+    a.download = `${player.gameId || "game"}-log.txt`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  },
+};
+
+// Before anything is downloaded: what the game cannot run without. WebGPU
+// counts only with an adapter: a browser can have the API and no device.
+let gpuAdapter = null;
+async function capabilities() {
+  if (navigator.gpu)
+    gpuAdapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" }).catch(() => null);
+  const checks = [
+    { id: "threads", ok: crossOriginIsolated && typeof SharedArrayBuffer === "function" },
+    { id: "webgpu", ok: !!gpuAdapter },
+    { id: "opfs", ok: !!navigator.storage?.getDirectory },
+    { id: "audioworklet", ok: typeof AudioWorkletNode === "function" },
+  ];
+  if (checks[2].ok) {
+    try { await navigator.storage.getDirectory(); } catch { checks[2].ok = false; }
+  }
+  return checks;
+}
+
+// One tab per game: two would write the same streamed copy and profile. The
+// lock is held for the page's life; another tab asks for it over the channel.
+function holdTab(id) {
+  if (!navigator.locks) return Promise.resolve();
+  const name = `recomp-${id}`;
+  const channel = new BroadcastChannel(name);
+  let release;
+  const held = new Promise((r) => { release = r; });
+  return new Promise((resolve) => {
+    navigator.locks.request(name, { ifAvailable: true }, (lock) => {
+      if (lock) { resolve(); channel.onmessage = yieldTab; return held; }
+      call("onProblem", "tab", {
+        takeOver() {
+          channel.postMessage("yield");
+          navigator.locks.request(name, () => { resolve(); channel.onmessage = yieldTab; return held; });
+        },
+      });
+      if (!UI.onProblem) status("The game is already open in another tab.");
+    });
+  });
+  function yieldTab(e) {
+    if (e.data !== "yield") return;
+    status("The game moved to another tab.", true);
+    setTimeout(() => location.replace("../"), 300);
+  }
+}
 
 async function gameId() {
   const parts = location.pathname.split("/").filter(Boolean);
@@ -68,9 +240,26 @@ async function gameId() {
 }
 
 async function start() {
-  if (!crossOriginIsolated) throw new Error("This page must be served cross-origin isolated (COOP/COEP headers).");
-  if (!navigator.gpu) throw new Error("This browser has no WebGPU.");
+  const checks = await capabilities();
+  if (checks.some((c) => !c.ok)) {
+    if (UI.onProblem) { call("onProblem", "unsupported", { checks }); return; }
+    if (!crossOriginIsolated) throw new Error("This page must be served cross-origin isolated (COOP/COEP headers).");
+    if (!navigator.gpu) throw new Error("This browser has no WebGPU.");
+  }
+  progress();
   const id = await gameId();
+  player.gameId = id;
+  await holdTab(id);
+  try {
+    if (localStorage.getItem(`recomp.clear.${id}`) === "1") {
+      localStorage.removeItem(`recomp.clear.${id}`);
+      const root = await navigator.storage.getDirectory();
+      const dir = await root.getDirectoryHandle(id).catch(() => null);
+      await dir?.removeEntry("stream", { recursive: true }).catch(() => {});
+    }
+  } catch {}
+  loaderState.build = await fetch("build.json").then((r) => (r.ok ? r.json() : {})).catch(() => ({}));
+  loaderState.engine.total = loaderState.build.wasmBytes || 0;
   const games = await fetch("../games.json").then((r) => r.json());
   const game = games.find((g) => g.id === id);
   if (!game) throw new Error(`No game "${id}" in the launcher's games.json.`);
@@ -90,11 +279,20 @@ async function start() {
   const remoteUrl = new URL("game/", location.href).href;
   if (!imported) {
     const probe = await fetch(remoteUrl + "manifest.txt", { method: "HEAD" }).catch(() => null);
-    if (!probe || !probe.ok) throw new Error(`${game.title} has not been imported yet.`);
+    if (!probe || !probe.ok) {
+      if (UI.onProblem) {
+        // The server is away: the theme retries (a fresh load, nothing is half-done).
+        call("onProblem", "portal", { retry: () => location.reload() });
+        return;
+      }
+      throw new Error(`${game.title} has not been imported yet.`);
+    }
     await navigator.storage.persist?.().catch(() => {});
   }
+  loaderState.streamed = !imported;
+  setStage("engine");
 
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+  const adapter = gpuAdapter;
   if (!adapter) throw new Error("WebGPU gave no adapter.");
   const wanted = ["texture-compression-bc", "depth32float-stencil8", "float32-filterable",
                   "unorm16-texture-formats", "rg11b10ufloat-renderable"];
@@ -108,7 +306,10 @@ async function start() {
                    "maxInterStageShaderVariables"])
     if (k in adapter.limits) requiredLimits[k] = adapter.limits[k];
   const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
-  device.lost.then((info) => status(`The graphics device was lost: ${info.message}`, true));
+  device.lost.then((info) => {
+    if (UI.onProblem) call("onProblem", "fatal", { message: `The graphics device was lost: ${info.message}` });
+    else status(`The graphics device was lost: ${info.message}`, true);
+  });
   device.addEventListener("uncapturederror", (e) => console.error("WebGPU:", e.error.message));
 
   const exe = imported ? `/opfs/${id}/game/${game.executable}` : `/remote/${game.executable}`;
@@ -118,8 +319,11 @@ async function start() {
     noInitialRun: true,
     print: (t) => { log.push(t); console.log(t); },
     printErr: (t) => { log.push(t); console.warn(t); },
-    setStatus: (t) => status(t ? t : ""),
-    onAbort: (what) => status(`The game stopped: ${what}`, true),
+    setStatus: (t) => { if (!UI.onProgress) status(t ? t : ""); },
+    onAbort: (what) => {
+      if (UI.onProblem) call("onProblem", "fatal", { message: `The game stopped: ${what}` });
+      else status(`The game stopped: ${what}`, true);
+    },
     preRun: [() => {
       const m = Module;
       m.ENV.RECOMP_PROFILE_DIR = `/opfs/${id}/profile`;
@@ -127,22 +331,76 @@ async function start() {
         m.ENV.RECOMP_REMOTE_GAME = remoteUrl;
         m.ENV.RECOMP_REMOTE_CACHE = `/opfs/${id}/stream`;
       }
+      m.ENV.RECOMP_REMOTE_FILL = String(player.fillPreference());
+      // A theme that shows a start button holds the game until it is pressed.
+      if (UI.onReady) m.ENV.RECOMP_WEB_GATE = "1";
       const extra = new URLSearchParams(location.search);
       for (const [k, v] of extra) if (k.startsWith("RECOMP_")) m.ENV[k] = v;
     }],
     onRuntimeInitialized() {
-      status("");
+      if (!UI.onProgress) status("");
+      player.module = Module;
       setupPerfButton(Module);
       setupSaves(id, game);
       canvas.focus();
+      setStage("archives");
       Module.callMain([`--exe=${exe}`]);
+      watchBoot(Module);
     },
   };
+  if (UI.onProgress) status("");
   window.Module = Module;
   const script = document.createElement("script");
   script.src = "@APP@.js";
   script.onerror = () => status("The game's web build is missing.", true);
   document.body.append(script);
+}
+
+// From callMain to the game running: the stream's counters while the game
+// loads, the start gate, then the counters for the theme's in-game widgets.
+function watchBoot(m) {
+  let readyCalled = false, startedAt = 0;
+  const tick = () => {
+    pollStream(m);
+    const boot = m._recomp_web_boot_state ? m._recomp_web_boot_state() : 2;
+    // Running from the first frame: the game spends a few seconds setting up
+    // after it starts, and the loader stays up (state.starting) until then.
+    const presented = !m._recomp_web_presents || m._recomp_web_presents() > 0;
+    if (boot === 1 && !readyCalled) {
+      readyCalled = true;
+      setStage("ready");
+      call("onReady", { start: () => { loaderState.starting = true; progress(); m._recomp_web_start?.(); } });
+    } else if (boot === 2 && loaderState.stage !== "running" &&
+               (presented || performance.now() - startedAt > 20000)) {
+      setStage("running");
+      call("onRunning");
+    }
+    if (boot === 2 && !startedAt) startedAt = performance.now();
+    if (loaderState.stage === "running") {
+      if (loaderState.streamed) call("onStream", loaderState.stream);
+      if (UI.onPacing && m._recomp_web_pacing) call("onPacing", readPacing(m));
+      setTimeout(tick, 250);
+    } else {
+      progress();
+      setTimeout(tick, 100);
+    }
+  };
+  tick();
+}
+
+// The frame statistics (recomp_web_pacing), for a theme that draws them. The
+// first read hands the overlay over: the engine stops drawing its own.
+let pacingTaken = false;
+function readPacing(m) {
+  if (!pacingTaken) { pacingTaken = true; m._recomp_web_overlay_external?.(1); }
+  const at = m._recomp_web_pacing() >> 3, h = m.HEAPF64;
+  const n = h[at + 10];
+  return {
+    newFps: h[at], displayFps: h[at + 1], medianMs: h[at + 2], p95Ms: h[at + 3], gpuMs: h[at + 4],
+    ageMs: h[at + 5], repeatPercent: h[at + 6], drops: h[at + 7], cap: h[at + 8], mode: h[at + 9],
+    intervals: Array.from(h.subarray(at + 11, at + 11 + n)),
+    hidden: player.overlayHidden,
+  };
 }
 
 // The performance overlay (drawn by the game in the top-left corner) folds
@@ -154,6 +412,7 @@ function setupPerfButton(m) {
   try { hidden = localStorage.getItem("recomp.perf.hidden") === "1"; } catch {}
   const apply = () => {
     m._recomp_web_overlay_hidden(hidden ? 1 : 0);
+    player.overlayHidden = hidden;
     button.textContent = hidden ? "▸ FPS" : "▾ FPS";
     button.setAttribute("aria-expanded", String(!hidden));
   };
@@ -280,7 +539,10 @@ function setupSaves(id, game) {
 
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 canvas.addEventListener("click", () => canvas.focus());
-start().catch((e) => status(e.message, true));
+start().catch((e) => {
+  if (UI.onProblem) call("onProblem", "fatal", { message: e.message });
+  else status(e.message, true);
+});
 </script>
 </body>
 </html>

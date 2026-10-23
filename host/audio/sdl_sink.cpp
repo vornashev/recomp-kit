@@ -79,9 +79,10 @@ class SdlSink final : public AudioSink {
     // (or stale data) before we could render.
     void report() {
         printf("[host] audio sink: %llu pulls, %llu late (>1.5 periods), %llu starved, max gap "
-               "%.1f ms, max render %.1f ms, period %.1f ms, ahead %u frames\n",
+               "%.1f ms, max render %.1f ms, mean render %.2f ms, period %.1f ms, ahead %u frames\n",
                (unsigned long long)pulls_, (unsigned long long)late_, (unsigned long long)starved_,
-               max_gap_ms_, max_render_ms_, period_ms_, ahead_frames_);
+               max_gap_ms_, max_render_ms_, pulls_ ? render_ms_ / double(pulls_) : 0.0, period_ms_,
+               ahead_frames_);
         fflush(stdout);
     }
     bool running() const override {
@@ -124,6 +125,7 @@ class SdlSink final : public AudioSink {
             double t0;
             ~RenderTimer() {
                 const double ms = double(SDL_GetTicksNS()) * 1e-6 - t0;
+                s->render_ms_ += ms;
                 if (ms > s->max_render_ms_)
                     s->max_render_ms_ = ms;
             }
@@ -139,7 +141,7 @@ class SdlSink final : public AudioSink {
         SDL_PutAudioStreamData(stream, self->interleaved_.data(), int(frames * 2 * sizeof(float)));
     }
     SDL_AudioStream *stream_ = nullptr;
-    double period_ms_ = 0, last_pull_ms_ = 0, max_gap_ms_ = 0, max_render_ms_ = 0;
+    double period_ms_ = 0, last_pull_ms_ = 0, max_gap_ms_ = 0, max_render_ms_ = 0, render_ms_ = 0;
     uint64_t pulls_ = 0, late_ = 0, starved_ = 0;
     uint32_t ahead_frames_ = 2048;
     double report_ms_ = 0;

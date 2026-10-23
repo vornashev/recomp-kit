@@ -65,6 +65,11 @@ std::atomic<bool> g_present_fifo{false};
 // (host_present_set_overlay_place).
 std::atomic<int> g_overlay_left{-1}, g_overlay_top{-1};
 std::atomic<bool> g_overlay_hidden{false};
+// A page that draws the numbers itself (host_present_set_overlay_external)
+// has the overlay left out of the frame; the last snapshot is kept for it.
+std::atomic<bool> g_overlay_external{false};
+std::mutex g_pacing_published_mutex;
+FramePacingSnapshot g_pacing_published;
 static std::mutex g_present_controls_mutex;
 static controls::ControlsView g_present_controls; // wanted = false until the host publishes
 
@@ -902,9 +907,15 @@ struct Service : std::enable_shared_from_this<Service> {
                             snapshot.p95_ms, snapshot.repeat_percent,
                             (unsigned long long)snapshot.drops);
                 }
+                if (g_overlay_external.load()) {
+                    std::lock_guard published(g_pacing_published_mutex);
+                    g_pacing_published = snapshot;
+                }
                 performance_overlay.draw(device, cb, drawable, drawable_desc.width,
                                          drawable_desc.height, snapshot, ts,
-                                         g_overlay_hidden.load() ? 0 : mods_display_overlay(),
+                                         g_overlay_hidden.load() || g_overlay_external.load()
+                                             ? 0
+                                             : mods_display_overlay(),
                                          mods_display_fps(), g_overlay_left.load(),
                                          g_overlay_top.load());
                 const controls::ControlsView controls_view = host_present_controls();
@@ -1815,6 +1826,13 @@ void host_present_set_overlay_place(int left, int top, bool hidden) {
     g_overlay_left.store(left);
     g_overlay_top.store(top);
     g_overlay_hidden.store(hidden);
+}
+void host_present_set_overlay_external(bool external) {
+    g_overlay_external.store(external);
+}
+FramePacingSnapshot host_present_pacing(void) {
+    std::lock_guard published(g_pacing_published_mutex);
+    return g_pacing_published;
 }
 void host_present_set_fifo(bool fifo) {
     g_present_fifo.store(fifo);

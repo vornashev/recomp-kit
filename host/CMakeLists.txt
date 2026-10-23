@@ -156,6 +156,9 @@ endfunction()
 # The mixer, its output device and the synth: portable, over SDL audio.
 set(POP_AUDIO_SOURCES ${HOST}/audio/mixer.cpp ${HOST}/audio/sdl_sink.cpp ${HOST}/audio/midi_synth.cpp
                       ${HOST}/audio_math.cpp ${HOST}/audio_capture.cpp)
+if(EMSCRIPTEN)
+  list(APPEND POP_AUDIO_SOURCES ${HOST}/audio/web_sink.cpp)
+endif()
 set(POP_CORE_LIBS recomp_platform recomp_runtime recomp_snapshot recomp_dx recomp_mods lua host_common gpu_backend)
 # The on-screen controls the presenter draws (controls_host.cpp is the app's own).
 set(POP_CONTROLS_SOURCES ${HOST}/controls/json.cpp ${HOST}/controls/layout.cpp
@@ -276,6 +279,20 @@ if(TARGET recomp_gen)
     # The player page (tools/web_launcher.py --web-build places it beside the launcher).
     set(APP ${RECOMP_APP_NAME})
     set(TITLE ${RECOMP_GAME_NAME})
+    # A game may dress the page: <game>/web/player/theme/ is published as
+    # theme/ beside it, and the page loads theme/theme.css and theme/theme.js
+    # (see window.recompUI in web/player/index.html). Copied on every build, so
+    # an edit to the theme needs no reconfigure.
+    set(THEME_HEAD "")
+    set(game_theme ${RECOMP_GAME_DIR}/web/player/theme)
+    if(EXISTS ${game_theme}/theme.js)
+      set(THEME_HEAD "<link rel=\"stylesheet\" href=\"theme/theme.css\">\n<script src=\"theme/theme.js\"></script>")
+      add_custom_target(web_theme ALL
+        COMMAND ${CMAKE_COMMAND} -E rm -rf ${POP_OUT}/theme
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${game_theme} ${POP_OUT}/theme
+        COMMENT "Copying the page theme")
+      add_dependencies(recomp_app web_theme)
+    endif()
     configure_file(${POP_ROOT}/web/player/index.html ${POP_OUT}/index.html @ONLY)
     # The streamed game folder: a WasmFS backend, so it needs WasmFS's own headers.
     target_sources(recomp_app PRIVATE ${HOST}/sdl/web_remote_fs.cpp)
@@ -284,9 +301,12 @@ if(TARGET recomp_gen)
     target_link_options(recomp_app PRIVATE
       -pthread -sPTHREAD_POOL_SIZE=24 -sWASMFS
       -sINITIAL_MEMORY=1073741824 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296
+      # Not -sGROWABLE_ARRAYBUFFERS: it would save the check for a grown heap on
+      # each JS access, but a view of a growable buffer is refused by
+      # FileSystemSyncAccessHandle.write, and every write to OPFS then fails.
       -sSTACK_SIZE=8388608 -sDEFAULT_PTHREAD_STACK_SIZE=16777216
       -sENVIRONMENT=web,worker -sEXIT_RUNTIME=0 -sINVOKE_RUN=0
-      -sEXPORTED_RUNTIME_METHODS=ENV,callMain,FS
+      -sEXPORTED_RUNTIME_METHODS=ENV,callMain,FS,HEAPF64
       --preload-file ${web_resources}@/app/resources)
   elseif(APPLE)
     pop_mac_bundle(recomp_app)

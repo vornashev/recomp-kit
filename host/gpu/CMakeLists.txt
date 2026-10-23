@@ -23,7 +23,7 @@ if(EMSCRIPTEN)
   target_compile_options(gpu_backend PUBLIC --use-port=emdawnwebgpu)
   target_link_options(gpu_backend PUBLIC --use-port=emdawnwebgpu)
   target_link_libraries(gpu_backend PUBLIC recomp_platform)
-  pop_optimize(gpu_backend 1)
+  pop_optimize(gpu_backend 2) # what presents every frame, as gpu_vulkan and gpu_metal are
   return()
 endif()
 

@@ -691,7 +691,13 @@ void recomp_callback_return(X86 *c) {
     // case intercept must finish that function through its SEH checkpoint.
     if (call->cpu != c || c->r[R_ESP] < call->return_sp + 4 || c->r[R_ESP] > call->saved_esp)
         return;
-    mods_hooks_unwind_to_esp(call->return_sp);
+    // The callee's RET has happened, so a hooked callee is over too: its
+    // invocation was entered with ESP == return_sp, and the longjmp below
+    // skips the dispatcher that would have popped it. Unwinding only frames
+    // strictly below return_sp left one behind per call; the next call at the
+    // same depth could not tell it apart from a live one, and a window
+    // procedure hook reached the depth limit after 32 messages.
+    mods_hooks_unwind_to_esp(call->return_sp + 4);
     recomp_profile_truncate(call->profile_depth);
     longjmp(call->env, 1);
 }

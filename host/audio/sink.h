@@ -20,3 +20,7 @@ struct AudioSink {
     virtual void pause(bool paused) = 0;
 };
 std::unique_ptr<AudioSink> make_sdl_sink();
+#ifdef __EMSCRIPTEN__
+// The browser's AudioWorklet, fed by a mixer thread (web_sink.cpp).
+std::unique_ptr<AudioSink> make_web_sink();
+#endif

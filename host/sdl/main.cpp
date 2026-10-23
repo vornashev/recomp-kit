@@ -54,6 +54,7 @@
 #include "../gpu/d3d9_backend.h"
 #include <emscripten/emscripten.h>
 #include <emscripten/wasmfs.h>
+#include <emscripten/threading.h>
 #include "web_remote_fs.h"
 #include <thread>
 #endif
@@ -1621,6 +1622,12 @@ void web_frame() {
         MAIN_THREAD_EM_ASM(
             {
                 var code = $0 >>> 0;
+                // A page theme shows its own dialog (window.recompUI.onExit).
+                var ui = window.recompUI;
+                if (ui && ui.onExit) {
+                    ui.onExit(code, $1 != 0);
+                    return;
+                }
                 var box = document.createElement("div");
                 box.style.cssText = "position:fixed;left:50%;top:40%;transform:translate(-50%,-50%);" +
                                     "background:rgba(20,16,10,.92);color:#f0e0b0;padding:18px 26px;" +
@@ -1632,9 +1639,48 @@ void web_frame() {
                                                   ". Reload the page to start again.";
                 document.body.appendChild(box);
             },
-            code);
+            code, process_exited() ? 1 : 0);
         emscripten_cancel_main_loop();
     }
+}
+
+// The start gate (RECOMP_WEB_GATE=1): the game is loaded and waits for the
+// page to say go, which it does from a click - the click browsers require
+// before sound may play, so the intro is heard from its first note.
+// 0 loading, 1 loaded and waiting, 2 running.
+std::atomic<int> g_web_boot{0};
+std::atomic<bool> g_web_go{false};
+extern "C" EMSCRIPTEN_KEEPALIVE int recomp_web_boot_state() {
+    return g_web_boot.load();
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void recomp_web_start() {
+    g_web_go.store(true);
+}
+// The frame statistics for a page that draws them itself (recomp_web_overlay_
+// external): new fps, display fps, median ms, p95 ms, gpu ms, age ms, repeat %,
+// drops, fps cap (0: the original pace), overlay mode (0 off, 1 numbers,
+// 2 with the graph), interval count, then up to 120 frame intervals in ms.
+extern "C" EMSCRIPTEN_KEEPALIVE double *recomp_web_pacing() {
+    static double out[11 + 120];
+    const FramePacingSnapshot s = host_present_pacing();
+    const double head[] = {s.new_fps, s.display_fps, s.median_ms, s.p95_ms, s.gpu_ms, s.age_ms,
+                           s.repeat_percent, double(s.drops), double(mods_display_fps()),
+                           double(mods_display_overlay())};
+    for (int i = 0; i < 10; ++i)
+        out[i] = head[i];
+    const size_t n = std::min<size_t>(120, s.intervals_ms.size());
+    out[10] = double(n);
+    for (size_t i = 0; i < n; ++i)
+        out[11 + i] = s.intervals_ms[s.intervals_ms.size() - n + i];
+    return out;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void recomp_web_overlay_external(int external) {
+    host_present_set_overlay_external(external != 0);
+}
+
+// Frames the game has presented: the page keeps its loader up until the first.
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t recomp_web_presents() {
+    return host_present_count();
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void recomp_web_overlay_hidden(int hidden) {
@@ -1677,6 +1723,12 @@ void web_guest() {
     printf(RECOMP_APP_NAME ": %s, entry %08x\n", loader_exe_path().c_str(), loader_entry_point());
     fflush(stdout);
     host_midi_startup(win32_midi_soundfont_path().c_str());
+    if (const char *gate = recomp_env("WEB_GATE"); gate && *gate && strcmp(gate, "0") != 0) {
+        g_web_boot.store(1);
+        while (!g_web_go.load())
+            emscripten_thread_sleep(20);
+    }
+    g_web_boot.store(2);
     boot_run();
     g_web_guest_done.store(true);
 }
